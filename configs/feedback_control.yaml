@@ -15,9 +15,9 @@ control:
 model:
   observer: ukf              # none | ekf | ukf | gru
   model_dir: state_estimation/training/learned_libraries/latent
-  data_stem: full_control_tip_old
-  model_prefix: structured
-  dynamics_model: structured_full_control_tip_old.npz
+  data_stem: full_control_tip
+  model_prefix: decoupled_mlp
+  dynamics_model: decoupled_mlp_full_control_tip.npz
   # Q and R are loaded from model npz files if available.
   # Fallback scalars when not saved in files:
   process_noise: 0.01

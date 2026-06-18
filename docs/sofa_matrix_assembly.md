@@ -130,16 +130,25 @@ Source: `EulerImplicitSolver.cpp:160`
 
 Projects b to the constrained space (FixedProjectiveConstraint, etc).
 
-### Final b_strain formula
+### Final b formula (full system)
 
 **Physical RHS** (what the C++ source computes, matching `EulerImplicitSolver.cpp:145-155`):
 
 ```
-b_physical = dt * [ -K*(q - q0)                        ← f (elastic force = -K*q)
-                    - (dt + β_solver) * K * v_strain    ← stiffness-velocity (addMBKv, BeamHookeLaw)
-                    - α * M_ss * v_strain               ← mass-velocity, strain-strain (addMBKv, mapped mass)
-                    - α * M_sb * v_base ]               ← mass-velocity, strain-base COUPLING (addMBKv, mapped mass)
+b_strain = dt * [ -K*(q - q0)                          ← f_elastic (BeamHookeLaw)
+                  - (dt + β_solver) * K * v_strain      ← stiffness-velocity (addMBKv, BeamHookeLaw)
+                  - α * M_ss * v_strain                 ← mass-velocity, strain-strain (mapped mass)
+                  - α * M_sb * v_base ]                 ← mass-velocity, strain-base COUPLING (mapped mass)
+
+b_base   = dt * [ -K_base * (x_base - x_rest)          ← f_spring (RestShapeSpringsForceField, nonlinear)
+                  - (dt + β_solver) * K_base * v_base   ← stiffness-velocity (addMBKv, RestShapeSprings)
+                  - α * M_bb * v_base                   ← mass-velocity, base-base (mapped mass)
+                  - α * M_bs * v_strain ]               ← mass-velocity, base-strain COUPLING (mapped mass)
 ```
+
+Note: `K_base` enters `b_base` via the linearized `addDForce`, which is diagonal: `df = -k · dv`.
+The *force* `f_spring` is nonlinear (quaternion axis-angle), but the velocity-dependent term
+uses the linearized tangent `K_base = diag(k, k, k, k_a, k_a, k_a)`.
 
 **WARNING: Python `solver.b()` / `solver.x()` are NOT the ODE RHS / solution.**
 
@@ -164,18 +173,15 @@ the constraint solver can overwrite them.
 The system matrix `solver.A()` is NOT affected — it is rebuilt each step
 by `setSystemMBKMatrix` and is correct when read from Python.
 
-### Physical b formula (strain block)
+### Physical b formula (parameters)
 
-```
-b_strain = dt * [ -K*(q - q0)                        ← f (elastic force = -K*q)
-                  - (dt + β_solver) * K * v_strain    ← stiffness-velocity (addMBKv, BeamHookeLaw)
-                  - α * M_ss * v_strain               ← mass-velocity, strain-strain (addMBKv, mapped mass)
-                  - α * M_sb * v_base ]               ← mass-velocity, strain-base COUPLING (addMBKv, mapped mass)
-```
+See "Final b formula (full system)" above for both strain and base blocks.
 
 Parameters:
 - `K` = BeamHookeLawForceField stiffness (block-diagonal, 32 × 3×3 blocks)
+- `K_base` = RestShapeSpringsForceField linearized stiffness = `diag(k, k, k, k_a, k_a, k_a)`
 - `q0` = rest position (zero for straight beam)
+- `x_rest` = commanded base rest position (updated each step by controller)
 - `α` = rayleighMass on solver (0.1)
 - `β_solver` = rayleighStiffness on solver (0.7)
 - `M_ss = J_strain^T * M_frame * J_strain` (configuration-dependent mapped mass)
@@ -240,6 +246,64 @@ This means:
 Source: `FreeMotionAnimationLoop.cpp:261-282`
 
 The constraint solver (`ProjectedGaussSeidelConstraintSolver`) solves for Lagrange multipliers (cable tensions, contact forces). These modify velocity and position AFTER the free motion solve. Cable forces (`CableConstraint`) do NOT appear in b or A — they act through the constraint correction step.
+
+## Base Frame Dynamics
+
+### Base DOF Representation
+
+- **Position**: `Rigid3d = (p ∈ R³, q ∈ S³)` — 7 stored values, 6 DOFs
+- **Velocity**: `RigidDeriv = (v, ω) ∈ R⁶` — linear + angular, **global frame**, no angle wrapping
+- **Integration**: exponential map `q_new = exp(ω·dt/2) · q_old` — singularity-free
+  - Source: `RigidCoord.h:108-131`, `operator+=` with `Quat::axisToQuat`
+- **Quaternion double-cover**: `q ≡ -q`; SOFA handles via `if (dq[3] < 0) dq *= -1` in `quatToAxis()` (`Quat.inl:249-276`)
+
+### Base Motion: Prescribed via RestShapeSpringsForceField
+
+- Controller updates `rest_position` each step: `q_rest = R_user(θ) · R_home · R_prefab`
+  - Source: `controllers/keyboard_controller.py:101-117`, `_apply_base_pose()`
+  - `θ` = rotation joint command (±180°), insertion = z-translation
+- **Nonlinear force** (addForce, `RestShapeSpringsForceField.inl:396-423`):
+  - `dq = q · q_rest⁻¹; normalize(dq); if dq[3] < 0: dq *= -1` (shorter path)
+  - Axis-angle: `angle = 2·acos(dq[3])`, `axis = dq[0:3] / sin(angle/2)`
+  - `f_rot -= angularStiffness · angle · axis`
+  - Translation: `f_trans -= stiffness · (p - p_rest)`
+- **Linearized tangent** (addDForce/addKToMatrix, `.inl:441-588`):
+  - **Diagonal**: `K_base = diag(k, k, k, k_a, k_a, k_a)`, no cross-coupling between rotation axes
+  - addDForce: `df -= k · dv` per component
+  - addKToMatrix: diagonal entries only
+- With `k = k_a = 1e10`: `A_bb ≈ 7.1e7·I`, `dv_base` rms ≈ 2.8e-4
+
+### Coupling: Base → Strain
+
+- **No direct stiffness coupling**: `K_bs = K_sb = 0` (RestShapeSprings is local to base, BeamHookeLaw is local to strain)
+- **Mass coupling via Cosserat mapping**: `M_sb = J_strain^T · M_frame · J_base`
+  - `||M_sb|| / ||M_ss|| = 31×` — large coupling through mapped mass
+  - Enters strain RHS: `b_s += h·(-α)·M_sb·v_base`
+- **Cable constraint**: `H_base ≈ 0` (max 5.3e-14) — cable only affects strain DOFs
+
+### Cosserat Mapping Velocity Chain
+
+Source: `DiscreteCosseratMapping.inl:200-298` (applyJ), `BaseCosseratMapping.inl:527-593` (buildProjector, buildAdjoint)
+
+- **Projector**: `P(T) = [[0,R],[R,0]]` — swaps between SOFA `[v,ω]` and Cosserat `[ω,v]` conventions
+- **SE(3) adjoint**: `Ad_g = [[R,0],[[p]×R, R]]` — propagation through sections
+- **Velocity chain**:
+  - `η_0 = P(T_base⁻¹) · v_base` (base velocity in body frame, convention-swapped)
+  - `η_i = Ad_{exp(-ξ_i·L_i)} · (η_{i-1} + T_tan,i · ξ̇_i)` (propagation through each section)
+  - `v_frame_i = P(T_i) · η_i` (back to SOFA convention for frame DOFs)
+
+### Verified Quantitative Summary
+
+| Finding | Value |
+|---|---|
+| Geometric stiffness | Exactly 0 (`applyDJT` empty) |
+| M_ss variation | 4.6% over trajectory |
+| `\|\|M_sb\|\| / \|\|M_ss\|\|` | 31× |
+| `\|\|Mv\|\| / \|\|f_elastic\|\|` | 0.5% (mass-proportional damping) |
+| `\|\|Kv\|\| / \|\|f_elastic\|\|` | 2.1% (stiffness-proportional damping) |
+| dv_base rms | 2.8e-4 (vs dv_strain ~1.4) |
+| β_ff asymmetry | In A but NOT in b RHS |
+| Cable linearity | B_eff residual 0.53% (nearly linear in λ) |
 
 ## Source File Reference
 

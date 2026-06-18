@@ -51,6 +51,11 @@ COLLECT_SCENE_IDX : int
 COLLECT_SCENES : str
     Path to a YAML file whose ``scenes`` list overrides the one in the
     main config.  Useful with ``generate_environments.py``.
+COLLECT_DEBUG : str
+    When "1", record diagnostic terms in matrix recorder (solver b/x,
+    forces, Jacobians, b-reconstruction analysis). Default "0".
+COLLECT_VERBOSE : str
+    When "1", print verbose diagnostics during recording. Default "0".
 """
 from __future__ import annotations
 
@@ -451,6 +456,11 @@ def createScene(root: Sofa.Core.Node, headless: bool = False,
             import inspect
             if "joint_max_speeds" in inspect.signature(gen_cls.__init__).parameters:
                 gen_kwargs["joint_max_speeds"] = np.array(robot.joint_rate, dtype=float)
+        speed_factor = float(os.environ.get("COLLECT_SPEED_FACTOR", "0"))
+        if speed_factor > 0:
+            import inspect
+            if "speed_factor" in inspect.signature(gen_cls.__init__).parameters:
+                gen_kwargs["speed_factor"] = speed_factor
         generator = gen_cls(joint_lower, joint_upper, dt, **gen_kwargs)
         if isinstance(enable_control, list):
             # Per-joint mask: e.g. [false, true, true]
@@ -538,11 +548,15 @@ def createScene(root: Sofa.Core.Node, headless: bool = False,
         if record_matrices:
             solver_node_obj = root.getChild("CatheterSimulation")
             A_interval = int(os.environ.get("COLLECT_A_INTERVAL", "1"))
+            verbose = os.environ.get("COLLECT_VERBOSE", "0") == "1"
+            debug = os.environ.get("COLLECT_DEBUG", "0") == "1"
             matrix_recorder = MatrixRecorderController(
                 name="MatrixRecorder",
                 robot=robot,
                 solver_node=solver_node_obj,
                 A_interval=A_interval,
+                verbose=verbose,
+                debug=debug,
             )
             root.addObject(matrix_recorder)
 
@@ -719,7 +733,7 @@ def _run_one_scene(scene_dict, scene_idx, total_scenes, output_dir=""):
             elapsed = time.time() - t0
             print(f"  step {step}, sim_time={step * dt:.2f}s, "
                   f"wall_time={elapsed:.1f}s", flush=True)
-        if max_duration > 0 and step * dt >= max_duration:
+        if max_duration > 0 and step * dt > max_duration:
             print(f"  Reached duration={max_duration:.1f}s, forcing save.")
             controller._finish()
             break
@@ -739,9 +753,15 @@ def _run_one_scene(scene_dict, scene_idx, total_scenes, output_dir=""):
         with h5py.File(h5_path, "a") as f:
             grp = f.create_group("matrices")
             for name, arr in mat_data.items():
-                if arr is not None and arr.size > 0:
+                if arr is None:
+                    continue
+                if np.ndim(arr) == 0:
+                    grp.create_dataset(name, data=arr)
+                elif hasattr(arr, 'size') and arr.size > 0:
                     grp.create_dataset(name, data=arr, compression="gzip",
                                        compression_opts=4)
+                else:
+                    grp.create_dataset(name, data=arr)
             grp.attrs["metadata"] = _json.dumps(mat_meta)
 
     Sofa.Simulation.unload(root)
@@ -756,14 +776,12 @@ def _write_collection_meta(output_dir, gen_name, gen_cls, gen_kwargs, dt,
 
     os.makedirs(output_dir, exist_ok=True)
 
-    # Copy rod and scene configs into the data folder
+    # Copy rod and scene configs into the data folder (always overwrite)
     scenes_path = os.environ.get("COLLECT_SCENES", "") or _SCENES_CONFIG_PATH
     rod_dst = os.path.join(output_dir, os.path.basename(_ROBOT_CONFIG_PATH))
     scene_dst = os.path.join(output_dir, os.path.basename(scenes_path))
-    if not os.path.exists(rod_dst):
-        shutil.copy2(_ROBOT_CONFIG_PATH, rod_dst)
-    if not os.path.exists(scene_dst):
-        shutil.copy2(scenes_path, scene_dst)
+    shutil.copy2(_ROBOT_CONFIG_PATH, rod_dst)
+    shutil.copy2(scenes_path, scene_dst)
 
     # Extract generator params from its __init__ signature defaults + kwargs
     import inspect
@@ -820,11 +838,15 @@ def run_headless(output_dir="", scene_indices=None):
     gen_name = os.environ.get("COLLECT_GENERATOR", "sweep")
     gen_cls = _GENERATORS.get(gen_name)
     gen_kwargs = {}
-    duration = float(os.environ.get("COLLECT_DURATION", "0"))
-    if duration > 0 and gen_cls is not None:
+    if gen_cls is not None:
         import inspect
-        if "duration" in inspect.signature(gen_cls.__init__).parameters:
+        sig = inspect.signature(gen_cls.__init__)
+        duration = float(os.environ.get("COLLECT_DURATION", "0"))
+        if duration > 0 and "duration" in sig.parameters:
             gen_kwargs["duration"] = duration
+        speed_factor = float(os.environ.get("COLLECT_SPEED_FACTOR", "0"))
+        if speed_factor > 0 and "speed_factor" in sig.parameters:
+            gen_kwargs["speed_factor"] = speed_factor
 
     with open(_ROBOT_CONFIG_PATH) as f:
         rod_cfg = yaml.safe_load(f)
@@ -865,10 +887,15 @@ if __name__ == "__main__":
                         help="Specific scene indices to init (default: all)")
     parser.add_argument("--output-dir", type=str, default="",
                         help="Output directory for HDF5 files (default: cwd)")
+    parser.add_argument("--debug", action="store_true",
+                        help="Record diagnostic terms in matrix recorder "
+                             "(solver b/x, forces, Jacobians, b-reconstruction)")
     args = parser.parse_args()
 
     if args.scenes:
         os.environ["COLLECT_SCENES"] = args.scenes
+    if args.debug:
+        os.environ["COLLECT_DEBUG"] = "1"
 
     if args.init:
         yaml_path = args.scenes or os.environ.get("COLLECT_SCENES", "") or _SCENES_CONFIG_PATH

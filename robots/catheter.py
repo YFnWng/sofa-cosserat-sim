@@ -263,6 +263,12 @@ def _build(
 
     _apply_variable_stiffness(prefab, rod_cfg)
 
+    # Override force-field rayleighStiffness (β_ff) independently of solver β.
+    # Default: same as solver (creates A/b asymmetry in implicit Euler).
+    beam_ff = prefab.cosseratCoordinate.BeamHookeLawForceField  # type: ignore[attr-defined]
+    beam_ff.findData("rayleighStiffness").value = float(
+        rod_cfg.get("rayleigh_stiffness_ff", rod_cfg.get("rayleigh_stiffness", 0.05)))
+
     prefab.rigidBaseNode.addObject(  # type: ignore[attr-defined]
         "RestShapeSpringsForceField",
         name="BaseAttachment",

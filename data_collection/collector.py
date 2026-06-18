@@ -113,7 +113,7 @@ class DataCollectorController(Sofa.Core.Controller):
         self._done = False
         self._t_start: Optional[float] = None
         self._joint_cmd = np.zeros(3)
-        self._t_begin = 0.0
+        self._t = 0.0
 
     def onAnimateBeginEvent(self, _event) -> None:
         if self._done:
@@ -121,24 +121,13 @@ class DataCollectorController(Sofa.Core.Controller):
         if self._base_mo is None or len(self._base_mo.position.value) == 0:
             return
 
-        self._step_count += 1
-
         # On first step, apply initial state and set rest positions so the
         # solver naturally maintains the configuration.
-        if self._step_count == 1:
+        if self._step_count == 0:
             self._apply_initial_state()
             return  # let solver run one step with correct state before generator
 
-        t_sim = float(self._base_mo.getContext().time.value)
-        if self._t_start is None:
-            self._t_start = t_sim
-
-        t = t_sim - self._t_start
-        self._t_begin = t
-
-        if self._generator.is_done(t):
-            self._finish()
-            return
+        t = self._t + self._t_start # t at the end of step
 
         self._joint_cmd = self._generator.step(t)
         self._joint_cmd = np.clip(self._joint_cmd, self._generator.joint_lower,
@@ -147,8 +136,11 @@ class DataCollectorController(Sofa.Core.Controller):
         self._update_tip_force(t)
 
     def onAnimateEndEvent(self, _event) -> None:
-        if self._done or self._step_count <= 1:
-            return
+        if self._step_count == 0:
+            self._t_start = float(self._base_mo.getContext().time.value)
+            self._t = 0.0
+        else:
+            self._t = float(self._base_mo.getContext().time.value) - self._t_start
 
         sofa_gt = self._reader.read()
 
@@ -158,7 +150,7 @@ class DataCollectorController(Sofa.Core.Controller):
             tip_force = np.array(forces[:3])
 
         self._record.append(
-            t=self._t_begin,
+            t=self._t,
             frame_poses=sofa_gt.frame_poses,
             strain_coords=sofa_gt.strain_coords,
             joint_commands=self._joint_cmd,
@@ -167,6 +159,12 @@ class DataCollectorController(Sofa.Core.Controller):
             frame_velocity=sofa_gt.frame_velocity,
             strain_velocity=sofa_gt.strain_velocity,
         )
+
+        self._step_count += 1
+
+        if self._generator.is_done(self._t):
+            self._finish()
+            return
 
     def _apply_initial_state(self) -> None:
         """Write saved base_pose and strain_coords to SOFA MOs.
