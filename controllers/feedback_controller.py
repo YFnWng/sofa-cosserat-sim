@@ -465,8 +465,8 @@ class FeedbackController(Sofa.Core.Controller):
         Constructs [xi, eta] from frame poses and velocities,
         matching the format expected by the latent observer.
         """
-        from state_estimation.utils import SE3_to_R9, world_velocity_to_body
-        from state_estimation.utils import pose_from_vec7
+        from cr_common.utils import SE3_to_R9, world_velocity_to_body
+        from cr_common.utils import pose_from_vec7
 
         tip_pose = sofa_gt.frame_poses[-1]
         T_tip = pose_from_vec7(tip_pose)

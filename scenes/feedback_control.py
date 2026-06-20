@@ -149,7 +149,7 @@ def createScene(root: Sofa.Core.Node, headless: bool = False,
     )
 
     # Build robot interface and sensor suite
-    from state_estimation.training.robot_interface import RobotInterface
+    from cr_common.robot_interface import RobotInterface
     robot_iface = RobotInterface.from_yaml(robot_config_path)
     sensor_suite = None
     sensor_cfg = robot_iface.sensor_config
