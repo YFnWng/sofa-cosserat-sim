@@ -168,7 +168,7 @@ def createScene(root: Sofa.Core.Node, headless: bool = False,
     torch.set_num_threads(1)
 
     # Build world model (observer + dynamics + observation)
-    from state_estimation.training.networks.world_model import build_model
+    from cr_meta_lnn.networks.world_model import build_model
     model_cfg = config.get("model", config.get("observer", {"observer": "none"}))
     # Resolve model_dir relative to workspace root, not CWD
     if "model_dir" in model_cfg and not os.path.isabs(model_cfg["model_dir"]):
