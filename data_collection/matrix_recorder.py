@@ -39,7 +39,10 @@ class MatrixRecorderController(Sofa.Core.Controller):
         self._initialized = False
 
         # Extracted once
+        self._M: Optional[np.ndarray] = None
         self._K: Optional[np.ndarray] = None
+        self._C: Optional[np.ndarray] = None
+        self._C_strain: Optional[np.ndarray] = None
         self._strain_offset: int = 0
         self._n_strain: int = 0
         self._n_base: int = 6
@@ -47,8 +50,11 @@ class MatrixRecorderController(Sofa.Core.Controller):
         self._alpha: float = 0.0
         self._beta: float = 0.0
         self._beta_ff: float = 0.0
+        self._beta_strain: float = 0.0
+        self._beta_eff: float = 0.0
         self._dt: float = 0.01
         self._base_mo = None
+        self._base_ff = None
         self._strain_mo = None
         self._frame_mo = None
         self._frame_mass = None
@@ -85,9 +91,10 @@ class MatrixRecorderController(Sofa.Core.Controller):
         self._diag_list: list = []
         self._diag_steps: list = []
 
-        # Cable constraint data (H and λ)
+        # Cable constraint data. NOTE: the tendon force λ is NOT stored — it is
+        # the joint command (cable channel of joint_commands), not the solver's
+        # `cc.d_force` (which reads 0 here). The old `cable_lambda` was useless.
         self._cable_constraints: list = []
-        self._cable_force_list: list = []    # λ per step (n_cables,)
         self._H_strain_list: list = []       # H projected to strain DOFs
         self._H_base_list: list = []         # H projected to base DOFs
 
@@ -105,17 +112,93 @@ class MatrixRecorderController(Sofa.Core.Controller):
             "base_force_mapped": [],
         }
 
+    def _extract_base_stiffness(self, base_ff):
+        """Base stiffness block K_base for the recorded system matrix.
+
+        Two cases:
+        - Legacy ``RestShapeSpringsForceField``: constant diagonal spring
+          ``diag(k, k, k, k_a, k_a, k_a)`` from its stiffness/angularStiffness Data.
+        - Structured ``BaseActuationForceField``: no such Data — its stiffness is
+          the linearised tangent ``K = blockdiag(-Jx_trans, -Jx_ang)`` exposed via
+          ``_tangent_blocks()``.  NOTE: this tangent is state-dependent (the
+          deadzone play operator P′(e)); the value here is the nominal one at
+          recorder init (zero tracking error → full Kb on the actuated DOFs), not a
+          global constant.
+        """
+        n = self._n_base
+        if base_ff is None:
+            print("[MatrixRecorder] No BaseAttachment found, K_base = 0")
+            return np.zeros((n, n))
+        # Legacy linear spring (has stiffness / angularStiffness Data).
+        try:
+            k_trans = float(base_ff.stiffness.value[0])
+            k_ang = float(base_ff.angularStiffness.value[0])
+            print(f"[MatrixRecorder] K_base (spring): stiffness={k_trans:.2e}, "
+                  f"angularStiffness={k_ang:.2e}")
+            return np.diag([k_trans] * 3 + [k_ang] * 3)
+        except Exception:
+            pass
+        # Structured base actuation: linearised tangent (K = -Jx).
+        if hasattr(base_ff, "_tangent_blocks"):
+            Jx_t, Jx_a, _, _ = base_ff._tangent_blocks()
+            K = np.zeros((6, 6))
+            K[:3, :3] = -np.asarray(Jx_t)
+            K[3:, 3:] = -np.asarray(Jx_a)
+            print("[MatrixRecorder] K_base (structured base, linearised tangent): "
+                  f"diag={np.round(np.diag(K), 3).tolist()}")
+            return K
+        print("[MatrixRecorder] Unknown BaseAttachment type, K_base = 0")
+        return np.zeros((n, n))
+
+    def _base_actuation_metadata(self, base_ff):
+        """Structured base-actuation parameters, or None for the legacy spring.
+
+        Ground truth for supervised training of the base law
+        ``f = Kb·P(r−b) − Db·ḃ − F0·tanh(ḃ/v0)`` (deadzone play P, half-width δ,
+        sharpness ε) on the two actuated DOFs [insertion, rotation], plus the
+        rigid-carriage spring/damping on the orthogonal-complement DOFs and the
+        frame conventions (world insertion axis u, home pose) needed to map the
+        recorded Rigid3d base pose to (insertion, rotation).
+        """
+        if base_ff is None or not hasattr(base_ff, "_Kb"):
+            return None
+        f = base_ff
+        # Per-DOF arrays are ordered [insertion, rotation].
+        return {
+            "law": "Kb*P(r-b) - Db*bdot - F0*tanh(bdot/v0); "
+                   "P(e)=softplus(e-delta)-softplus(-e-delta)",
+            "dof_order": ["insertion", "rotation"],
+            "Kb": np.asarray(f._Kb).tolist(),
+            "Db": np.asarray(f._Db).tolist(),
+            "F0": np.asarray(f._F0).tolist(),
+            "v0": np.asarray(f._v0).tolist(),
+            "delta": np.asarray(f._delta).tolist(),
+            "eps": np.asarray(f._eps).tolist(),
+            "K_perp": float(f._K_perp), "B_perp": float(f._B_perp),
+            "K_tilt": float(f._K_tilt), "B_tilt": float(f._B_tilt),
+            "insertion_axis": np.asarray(f._u).tolist(),
+            "home_position": np.asarray(f._p_home).tolist(),
+            "home_orientation_quat": f._R_home.as_quat().tolist(),
+        }
+
     def _init_matrices(self):
         """Extract constant matrices and locate strain DOF block."""
         from utils.matrix_analysis import extract_matrices
         M, K, C, alpha, beta, info = extract_matrices(
             self._robot, self._solver_node)
 
+        self._M = M
         self._K = K
+        self._C = C
         self._n_strain = info["n_strain"]
         self._strain_offset = info["strain_offset"]
         self._alpha = alpha
         self._beta = beta
+        # Explicit strain damping (rod β·K when solver β=0); needed both for the
+        # recorded damping C and for the per-step M_ss back-solve below.
+        self._C_strain = info.get("C_strain", np.zeros_like(K))
+        self._beta_strain = info.get("beta_strain", 0.0)
+        self._beta_eff = info.get("beta_eff", beta)
         self._dt = info["dt"]
 
         prefab = self._robot._prefab
@@ -126,17 +209,13 @@ class MatrixRecorderController(Sofa.Core.Controller):
         self._n_base = self._strain_offset
         self._n_full = self._n_base + self._n_strain
 
-        # Extract base stiffness from RestShapeSpringsForceField
+        # Extract the base stiffness block.  Handles both the legacy
+        # RestShapeSpringsForceField (constant diagonal spring) and the structured
+        # BaseActuationForceField (no stiffness/angularStiffness Data — its stiffness
+        # is the linearised tangent K = blockdiag(-Jx_trans, -Jx_ang)).
         base_spring = prefab.rigidBaseNode.getObject("BaseAttachment")
-        if base_spring is not None:
-            k_trans = float(base_spring.stiffness.value[0])
-            k_ang = float(base_spring.angularStiffness.value[0])
-            self._K_base = np.diag([k_trans] * 3 + [k_ang] * 3)
-            print(f"[MatrixRecorder] K_base: stiffness={k_trans:.2e}, "
-                  f"angularStiffness={k_ang:.2e}")
-        else:
-            self._K_base = np.zeros((self._n_base, self._n_base))
-            print("[MatrixRecorder] No BaseAttachment found, K_base = 0")
+        self._base_ff = base_spring
+        self._K_base = self._extract_base_stiffness(base_spring)
 
         self._strain_mo = prefab.cosseratCoordinate.cosseratCoordinateMO
 
@@ -287,24 +366,25 @@ class MatrixRecorderController(Sofa.Core.Controller):
             self._find_cable_constraints(child)
 
     def _record_cable_data(self):
-        """Record constraint Jacobian H and cable forces λ.
+        """Record the constraint Jacobian H_strain (and H_base in debug).
 
-        When debug=False, only H_strain is recorded (sufficient for LNN
-        training).  cable_lambda and H_base are debug-only.
+        The tendon force λ is NOT recorded here: under this force-control setup
+        the cable constraint force `cc.d_force.value` reads 0 (verified
+        repeatedly — it was the old useless `cable_lambda` field, now removed).
+        The actual λ IS the joint command itself — the cable channel of
+        `joint_commands` — so the tendon impulse is Hᵀλ with λ = commanded
+        tension, recoverable from the dataset without re-collection.
         """
         ns = self._n_strain
         nb = self._n_base
 
-        if self._debug:
-            forces = []
-            for cc in self._cable_constraints:
-                try:
-                    forces.append(float(cc.d_force.value))
-                except Exception:
-                    forces.append(0.0)
-            self._cable_force_list.append(np.array(forces))
-
-        # H_strain: always recorded (needed for tendon mapping verification)
+        # H_strain: always recorded (needed for tendon mapping verification).
+        # CONVENTION: recorded in the SOFA Cosserat x-tangent ("raw MO") frame,
+        # same as K/M/A — downstream (train_lnn_supervised) rotates it x→z to
+        # match the z-tangent latent before projecting. NOTE: a standalone
+        # analytic TendonPCSModule(V) is also in x, so matching the *unrotated*
+        # H_strain at corr 1.0 does NOT imply H is already in z (verified: the
+        # x→z rotation IS required — skipping it blows up the rollout).
         try:
             H_strain_raw = self._strain_mo.constraint.value
             if hasattr(H_strain_raw, 'toarray'):
@@ -565,7 +645,10 @@ class MatrixRecorderController(Sofa.Core.Controller):
         A_sb = A_full[off:off+ns, :nb]
         coeff_M = 1.0 + dt * self._alpha
         coeff_K_A = dt * (dt + self._beta + self._beta_ff)
-        M_ss = (A_ss - coeff_K_A * K) / coeff_M
+        # Strain damping (DiagonalVelocityDamping) adds dt·C_strain to A_ss; remove
+        # it before back-solving M_ss, else it leaks into the mass estimate.
+        C_strain = self._C_strain if self._C_strain is not None else 0.0
+        M_ss = (A_ss - coeff_K_A * K - dt * C_strain) / coeff_M
         M_ss = 0.5 * (M_ss + M_ss.T)
         M_sb = A_sb / coeff_M
 
@@ -666,6 +749,21 @@ class MatrixRecorderController(Sofa.Core.Controller):
         if f_begin is not None:
             diag["f_begin"] = f_begin.copy()
 
+        # Dynamics RHS of the FREE-MOTION solve (the one we actually want).
+        # solver.b()/x() captured at frame-end hold the LAST LDL solve, which under
+        # FreeMotion is a constraint-correction solve — NOT the free-motion dynamics
+        # solve.  Reconstruct the dynamics RHS from the free-motion velocity
+        # increment: b_dyn = A·Δv_free, where Δv_free = v_free − v_pre (full DOF,
+        # SOFA order [base, strain]).  VERIFIED machine-exact (≈1e-15): this equals
+        # h·f − h²·K·v, so the open-loop full-space rollout (Δv = A⁻¹·b_dyn,
+        # x += h·v) reproduces SOFA exactly.  (GenericConstraintCorrection reuses
+        # A's factorization, so A is unchanged.)
+        if v_free is not None and b_v_free is not None:
+            dv_free_full = np.concatenate(
+                [b_v_free[:nb] - v_base, v_free[:ns] - v_pre])
+            diag["dv_free"] = dv_free_full.copy()
+            diag["b_dynamics"] = (A_full @ dv_free_full).copy()
+
         # Base MO fields (truncated to nb)
         diag["base_q_pos"] = b_q_pos[:nb].copy()
         diag["base_v_vel"] = b_v_vel[:nb].copy()
@@ -725,13 +823,18 @@ class MatrixRecorderController(Sofa.Core.Controller):
         vectors, forces, diagnostics, Jacobians, etc.
         """
         data = {
+            "M_strain": self._M,
             "K_strain": self._K,
+            "C_strain": self._C,            # total rod damping: αM + βK + explicit strain damping
+            "C_strain_explicit": self._C_strain,  # the DiagonalVelocityDamping part alone (β·K)
             "K_base": self._K_base,
             "A_full_samples": np.stack(self._A_full_list) if self._A_full_list else np.array([]),
             "A_full_steps": np.array(self._A_steps, dtype=np.int64),
             "alpha": np.float64(self._alpha),
             "beta": np.float64(self._beta),
             "beta_ff": np.float64(self._beta_ff),
+            "beta_strain": np.float64(self._beta_strain),
+            "beta_eff": np.float64(self._beta_eff),
         }
         if self._H_strain_list:
             data["H_strain"] = np.stack(self._H_strain_list)
@@ -779,6 +882,7 @@ class MatrixRecorderController(Sofa.Core.Controller):
             opt_keys = [
                 "q_free", "v_free", "derivX", "solution_mo", "rhs_mo",
                 "dforce", "lambda", "constraint_dx", "f_begin",
+                "dv_free", "b_dynamics",
                 "base_q_free", "base_v_free", "base_derivX",
                 "base_solution", "base_rhs_mo", "base_force",
                 "base_dforce", "base_lambda", "base_constraint_dx",
@@ -796,8 +900,8 @@ class MatrixRecorderController(Sofa.Core.Controller):
             data["diag_combo_residuals"] = combo_arr
             data["diag_combo_names"] = np.array(combo_keys, dtype="S")
 
-        if self._cable_force_list:
-            data["cable_lambda"] = np.stack(self._cable_force_list)
+        # (cable_lambda removed — it read 0; λ is the joint command, see
+        #  _record_cable_data)
         if self._H_base_list:
             data["H_base"] = np.stack(self._H_base_list)
 
@@ -818,9 +922,10 @@ class MatrixRecorderController(Sofa.Core.Controller):
 
         Debug-only data fields (recorded when debug=True):
         - Per-step: q_pre_solve, v_pre_solve, v_base_pre_solve,
-          cable_lambda, H_base, solver_b_full, solver_x_full,
+          H_base, solver_b_full, solver_x_full,
           f_strain, f_base, q_post_solve, v_frame_pre_solve,
           f_strain_begin, cpp_* diagnostic vectors.
+          (cable_lambda removed — useless; tendon λ = the joint command.)
         - Per-A_interval: J_samples, diag_* fields.
         """
         meta = {
@@ -831,10 +936,17 @@ class MatrixRecorderController(Sofa.Core.Controller):
             "alpha": self._alpha,
             "beta": self._beta,
             "beta_ff": self._beta_ff,
+            "beta_strain": self._beta_strain,   # effective rod β carried by C_strain
+            "beta_eff": self._beta_eff,          # total rod stiffness-damping β
             "dt": self._dt,
             "A_interval": self._A_interval,
             "strain_rotation": self._strain_rot.tolist(),
         }
+        # Structured base-actuation parameters (ground truth for supervised
+        # training of the base law: f = Kb·P(r−b) − Db·ḃ − F0·tanh(ḃ/v0)).
+        base_params = self._base_actuation_metadata(self._base_ff)
+        if base_params is not None:
+            meta["base_actuation"] = base_params
         if self._cable_constraints:
             meta["n_cables"] = len(self._cable_constraints)
             meta["cable_names"] = [c.getName() for c in self._cable_constraints]

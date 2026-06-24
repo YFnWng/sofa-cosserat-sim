@@ -25,6 +25,7 @@ from useful.params import (  # type: ignore
 )
 
 from utils.cable_utils import compute_cable_points
+from robots.base_actuation_forcefield import BaseActuationForceField
 
 _DEFAULT_CONFIG = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -212,6 +213,63 @@ def _apply_variable_stiffness(prefab: CosseratBase, rod_cfg: dict) -> None:
     beam_ff.findData("poissonRatioList").value = nu_per_section.tolist()
 
 
+def _strain_rayleigh_coefficients(beam_ff, beta: float):
+    """Per-section DiagonalVelocityDamping coefs reproducing Rayleigh β·K on the rod.
+
+    The beam force is ``f -= (K_section · strain) · L`` with the DIAGONAL section
+    stiffness ``K_section = diag(K0, K1, K2)`` (strain order
+    ``[torsion, bend_y, bend_z]``).  Rayleigh stiffness damping is ``C = β·K``, so
+    the equivalent explicit velocity-damping coefficient for section ``i`` is
+    ``c_i = β · diag(K_section_i) · L_i``.
+
+    ``K_section`` is a private C++ member of BeamHookeLawForceField (rebuilt in
+    ``reinit()``) — not exposed as Data or via any Python accessor — so we cannot
+    read it directly.  Instead we mirror ``reinit()`` exactly, reading the beam's
+    own Data for every branch (cross-section, variant/uniform sections, inertia
+    params) so the result matches whatever stiffness the beam actually uses.
+
+    Returns a list of 3-vectors (one per section), or ``None`` if β ≤ 0.
+    """
+    if beta <= 0:
+        return None
+    d = lambda n: beam_ff.findData(n).value
+    lengths = np.asarray(d("length"), dtype=float)
+    n_sec = len(lengths)
+    if n_sec == 0:
+        return None
+
+    # Cross-section second moments / polar moment (mirrors reinit()).
+    shape = d("crossSectionShape")
+    shape = shape.getSelectedItem() if hasattr(shape, "getSelectedItem") else str(shape)
+    if shape == "rectangular":
+        Ly, Lz = float(d("lengthY")), float(d("lengthZ"))
+        Iy = Ly * Lz**3 / 12.0
+        Iz = Lz * Ly**3 / 12.0
+    else:  # circular (default)
+        r, r_in = float(d("radius")), float(d("innerRadius"))
+        Iy = Iz = np.pi * (r**4 - r_in**4) / 4.0
+    J = Iy + Iz
+
+    def K_diag(E, nu):
+        """diag(G·J, E·Iy, E·Iz) for one section."""
+        G = E / (2.0 * (1.0 + nu))
+        return np.array([G * J, E * Iy, E * Iz])
+
+    if bool(d("variantSections")):
+        E_list = np.asarray(d("youngModulusList"), dtype=float)
+        nu_list = np.asarray(d("poissonRatioList"), dtype=float)
+        K_per = [K_diag(E_list[i], nu_list[i]) for i in range(n_sec)]
+    elif bool(d("useInertiaParams")):
+        # Stiffness given directly as inertia params — read from Data, no recompute.
+        K_uniform = np.array([float(d("GI")), float(d("EI")), float(d("EI"))])
+        K_per = [K_uniform] * n_sec
+    else:
+        K_uniform = K_diag(float(d("youngModulus")), float(d("poissonRatio")))
+        K_per = [K_uniform] * n_sec
+
+    return [(beta * K_per[i] * lengths[i]).tolist() for i in range(n_sec)]
+
+
 def _build(
     root: Sofa.Core.Node,
     rod_cfg: dict,
@@ -221,13 +279,44 @@ def _build(
     solver_node = root.addChild("CatheterSimulation")
     rayleigh_stiffness = float(rod_cfg.get("rayleigh_stiffness", rod_cfg.get("rayleigh", 0.05)))
     rayleigh_mass = float(rod_cfg.get("rayleigh_mass", 1e-3))
+    # --- Rod damping & base decoupling -------------------------------------
+    # The rod needs stiffness-proportional damping (β·K): it damps the high-
+    # frequency strain modes (largely discretisation artefacts) for stable
+    # implicit integration while leaving the slow physical bending mode lively
+    # (ζ_i = (β/2)·ω_i grows with frequency).  A uniform velocity damping (c·I)
+    # would instead over-damp the bending mode, so it is NOT a substitute.
+    #
+    # Physically, β·K is the discrete form of Kelvin–Voigt INTERNAL/material
+    # damping (σ = E·ε + η·ε̇ ⇒ C = (η/E)·K, β = η/E = a material relaxation
+    # time): dissipation that scales with each section's elastic stiffness.  It
+    # is genuinely realistic for a polymer rod, BUT the current β value is a
+    # NUMERICAL-STABILITY choice, not calibrated to the catheter's measured loss
+    # tangent (a physical η/E would be much smaller).  External drag (fluid /
+    # tissue resistance) is a *separate*, velocity-proportional mechanism (≈ a
+    # uniform/mass-proportional term) not modelled here.
+    # TODO(fidelity): if simulated rod transients must match a real catheter,
+    # calibrate this into (i) a small internal β·K from material loss + (ii) a
+    # uniform external-drag term sized to the medium (air vs blood/tissue),
+    # rather than the single numerical β below.
+    #
+    # IMPLEMENTATION: rather than the solver's GLOBAL rayleighStiffness (which
+    # would also damp the soft base actuator and bury its friction — β·Kb is
+    # huge), we set the solver β to 0 and apply the rod's β·K damping as an
+    # EXPLICIT, strain-local DiagonalVelocityDampingForceField with coefficients
+    # = β·diag(K_section)·L (computed below).  That is mathematically identical
+    # to solver Rayleigh on the rod but leaves the base Rayleigh-free, so the
+    # base actuation's deadzone/friction is visible.
+    base_act_enabled = bool(rod_cfg.get("base_actuation", {}).get("enabled", False))
+    solver_rayleigh = 0.0 if base_act_enabled else rayleigh_stiffness
     import os
+    # NOTE: compare to "1" — a bare os.environ.get() is truthy for ANY value
+    # (including "0"), so COLLECT_DIAGNOSTIC_SOLVER=0 would otherwise still enable it.
     solver_type = ("DiagnosticEulerImplicitSolver"
-                   if os.environ.get("COLLECT_DIAGNOSTIC_SOLVER")
+                   if os.environ.get("COLLECT_DIAGNOSTIC_SOLVER", "0") == "1"
                    else "EulerImplicitSolver")
     solver_node.addObject(
         solver_type,
-        rayleighStiffness=rayleigh_stiffness,
+        rayleighStiffness=solver_rayleigh,
         rayleighMass=rayleigh_mass,
     )
     solver_node.addObject(
@@ -263,31 +352,74 @@ def _build(
 
     _apply_variable_stiffness(prefab, rod_cfg)
 
-    # Override force-field rayleighStiffness (β_ff) independently of solver β.
-    # Default: same as solver (creates A/b asymmetry in implicit Euler).
+    # Force-field rayleighStiffness (β_ff): kept 0.  (β_ff would enter the system
+    # matrix A but NOT the RHS b — bFactor=0 in the RHS assembly — so it provides
+    # no real energy dissipation and the rod rings; not a usable damping source.)
     beam_ff = prefab.cosseratCoordinate.BeamHookeLawForceField  # type: ignore[attr-defined]
     beam_ff.findData("rayleighStiffness").value = float(
-        rod_cfg.get("rayleigh_stiffness_ff", rod_cfg.get("rayleigh_stiffness", 0.05)))
+        rod_cfg.get("rayleigh_stiffness_ff", 0.0))
 
-    prefab.rigidBaseNode.addObject(  # type: ignore[attr-defined]
-        "RestShapeSpringsForceField",
-        name="BaseAttachment",
-        stiffness=1e10,
-        angularStiffness=1e10,
-        external_points=0,
-        points=0,
-        template="Rigid3d",
-    )
-    # Rod-only damping: damps strain velocities without affecting the base.
-    # Use this with low global Rayleigh damping so the base tracks commands
-    # crisply while the rod still has physical damping.
-    rod_damping = float(rod_cfg.get("strain_damping", 0.0))
-    if rod_damping > 0:
-        prefab.cosseratCoordinate.addObject(  # type: ignore[attr-defined]
-            "UniformVelocityDampingForceField",
-            name="StrainDamping",
-            dampingCoefficient=rod_damping,
+    base_act_cfg = rod_cfg.get("base_actuation", {})
+    if base_act_cfg.get("enabled", False):
+        # Realistic base drive: soft structured law (deadzone/backlash + friction)
+        # on insertion + axial rotation, rigid carriage on the other DOFs.
+        # Frame conventions mirror the controllers (see collector.py):
+        #   u (world insertion axis) = direction_local @ base_orient.T
+        #   q_home_full              = base_orient * prefab_rot
+        direction_local = np.asarray(
+            act_cfg.get("insertion_direction", [0.0, 0.0, 1.0]), dtype=float)
+        u_world = direction_local @ base_orient.as_matrix().T
+        q_home_full = (base_orient * prefab_rot).as_quat().tolist()
+        prefab.rigidBaseNode.addObject(  # type: ignore[attr-defined]
+            BaseActuationForceField(
+                name="BaseAttachment",
+                mo=prefab.rigidBaseNode.RigidBaseMO,  # type: ignore[attr-defined]
+                insertion_axis=u_world.tolist(),
+                home_position=list(base_pos),
+                home_orientation=q_home_full,
+                insertion=base_act_cfg["insertion"],
+                rotation=base_act_cfg["rotation"],
+                non_actuated=base_act_cfg["non_actuated"],
+            )
         )
+    else:
+        # Fallback: legacy stiff spring (A/B regression baseline).
+        prefab.rigidBaseNode.addObject(  # type: ignore[attr-defined]
+            "RestShapeSpringsForceField",
+            name="BaseAttachment",
+            stiffness=1e10,
+            angularStiffness=1e10,
+            external_points=0,
+            points=0,
+            template="Rigid3d",
+        )
+    # Rod damping (strain-local, leaves the base untouched).
+    if base_act_enabled:
+        # Stiffness-proportional Rayleigh-equivalent: c_i = β·diag(K_section_i)·L_i,
+        # matching the beam exactly (force is K_section·strain·L) so this reproduces
+        # solver Rayleigh on the rod while the solver β stays 0 for the base.  K is
+        # diagonal [G·J, E·Iy, E·Iz] so DiagonalVelocityDampingForceField (per-DOF,
+        # per-component) gives an EXACT match; a scalar UniformVelocityDamping (c·I)
+        # would over-damp the bending mode (see header note on damping physics).
+        # implicit=… is unconditional for DiagonalVelocityDamping (always builds
+        # the df/dv matrix term), unlike UniformVelocityDamping.
+        coefs = _strain_rayleigh_coefficients(beam_ff, rayleigh_stiffness)
+        if coefs is not None:
+            prefab.cosseratCoordinate.addObject(  # type: ignore[attr-defined]
+                "DiagonalVelocityDampingForceField",
+                name="StrainDamping",
+                dampingCoefficient=coefs,
+            )
+    else:
+        # Legacy path: solver Rayleigh damps the rod; optional extra uniform damping.
+        rod_damping = float(rod_cfg.get("strain_damping", 0.0))
+        if rod_damping > 0:
+            prefab.cosseratCoordinate.addObject(  # type: ignore[attr-defined]
+                "UniformVelocityDampingForceField",
+                name="StrainDamping",
+                dampingCoefficient=rod_damping,
+                implicit=True,
+            )
 
     # Scale visual aids to ~10% of rod length for visibility
     _vis_scale = params.beam_geo_params.beam_length * 0.005

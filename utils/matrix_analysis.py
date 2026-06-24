@@ -19,6 +19,33 @@ from __future__ import annotations
 import numpy as np
 
 
+def _strain_damping_matrix(prefab, n_strain):
+    """Explicit strain velocity-damping matrix C_strain (n_strain × n_strain).
+
+    This is where the rod's stiffness-proportional (β·K) damping now lives when
+    base actuation is enabled: a ``DiagonalVelocityDampingForceField`` on the
+    strain with per-section coefficients ``β·diag(K_section)·L``.  Returns 0 if
+    absent, and handles the legacy scalar ``UniformVelocityDampingForceField``.
+
+    It contributes ``dt·C_strain`` to the assembled system matrix A (via
+    ``addBToMatrix`` with bFactor=-dt), so the matrix extraction must account for
+    it both when back-solving M and when reporting the damping C.
+    """
+    sd = prefab.cosseratCoordinate.getObject("StrainDamping")
+    if sd is None:
+        return np.zeros((n_strain, n_strain))
+    coef_val = np.asarray(sd.findData("dampingCoefficient").value, dtype=float)
+    if coef_val.ndim == 2:  # DiagonalVelocityDamping: per-DOF [.,.,.] coefficients
+        ncomp = coef_val.shape[1]
+        n_blocks = n_strain // ncomp
+        diag = np.concatenate(
+            [coef_val[min(i, len(coef_val) - 1)] for i in range(n_blocks)])
+        return np.diag(diag[:n_strain])
+    # UniformVelocityDamping: scalar coefficient
+    c = float(np.ravel(coef_val)[0]) if coef_val.size else 0.0
+    return c * np.eye(n_strain)
+
+
 def extract_matrices(robot, solver_node):
     """Extract M, K, C matrices in strain coordinate space.
 
@@ -114,20 +141,38 @@ def extract_matrices(robot, solver_node):
     coeff_M = 1.0 + dt * alpha
     coeff_K = dt * (dt + beta + beta_ff)
 
-    M = (A_strain - coeff_K * K) / coeff_M
+    # Explicit strain damping (DiagonalVelocityDamping): carries the rod's β·K
+    # stiffness-proportional damping when the solver β is 0 (base-actuation mode).
+    # It adds dt·C_strain to A, so subtract it before back-solving M.
+    C_strain = _strain_damping_matrix(prefab, n_strain)
+    M = (A_strain - coeff_K * K - dt * C_strain) / coeff_M
 
     # Symmetrize
     M = 0.5 * (M + M.T)
     K = 0.5 * (K + K.T)
+    C_strain = 0.5 * (C_strain + C_strain.T)
 
-    # Damping matrix
-    C = alpha * M + beta * K
+    # Total rod damping = Rayleigh (αM + βK from the solver) + explicit strain
+    # damping.  With base actuation β_solver=0 and C_strain ≈ β·K, so C matches
+    # the legacy αM + βK exactly — the stiffness-proportional damping just moved
+    # from the solver into C_strain.
+    C = alpha * M + beta * K + C_strain
+
+    # Effective stiffness-proportional damping coefficient carried by C_strain
+    # (β_strain such that C_strain ≈ β_strain·K), for consumers that want a scalar.
+    kdiag = np.diag(K)
+    nz = np.abs(kdiag) > 1e-12
+    beta_strain = (float(np.median(np.diag(C_strain)[nz] / kdiag[nz]))
+                   if nz.any() else 0.0)
 
     info = {
         "n_strain": n_strain,
         "n_global": n_global,
         "strain_offset": offset,
         "dt": dt,
+        "C_strain": C_strain,        # explicit strain damping matrix
+        "beta_strain": beta_strain,  # effective β carried by C_strain (≈ rayleigh_stiffness)
+        "beta_eff": beta + beta_strain,  # total effective stiffness-damping β (rod)
     }
 
     return M, K, C, alpha, beta, info
