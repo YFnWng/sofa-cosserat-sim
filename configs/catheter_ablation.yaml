@@ -4,6 +4,9 @@ rod:
   length: 160.0e-3       # m (total arc length)
   n_sections: 32
   n_frames: 32           # geometry.py appends tip → 32+1=33 total SOFA frames = n_sections+1
+  # Boundary used only by privileged component-resolved recordings. Sections
+  # [0, distal_start_section) are the unobserved proximal segment.
+  distal_start_section: 25
   beam_radius: 1.45e-3   # m (beam cross-section radius)
   kirchhoff: true
   # Physics
@@ -58,16 +61,16 @@ rod:
       Kb: 5.0e3
       Db: 2.0
       F0: 0.5
-      v0: 5.0e-2         # friction smoothing speed (sharper -> chatter; explicit)
+      v0: 5.0e-1         # friction smoothing speed (sharper -> chatter; explicit)
       delta: 1.0e-3      # ~1 mm backlash half-width
-      eps: 2.0e4         # eps*delta ~ 4 → fairly sharp deadzone
+      eps: 2.0e2         # eps*delta ~ 4 → fairly sharp deadzone
     rotation:   # Kb [N·m/rad], Db [N·m·s/rad], F0 [N·m], v0 [rad/s], delta [rad], eps [1/rad]
       Kb: 2.0
       Db: 0.02
       F0: 0.02
-      v0: 0.2
+      v0: 2.0
       delta: 0.5      # ~30 deg backlash half-width
-      eps: 200.0
+      eps: 50.0
     non_actuated:  # rigid carriage on DOFs orthogonal to the insertion axis
       K_perp: 1.0e6
       B_perp: 1.0e3

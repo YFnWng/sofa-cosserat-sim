@@ -39,7 +39,7 @@ trajectory starts from the default rod configuration.
 Environment variables
 ---------------------
 COLLECT_GENERATOR : str
-    Generator type: ``sweep`` (default) or ``sinusoidal``.
+    Generator type: ``sweep`` (default), ``sinusoidal``, or ``proximal_id``.
 COLLECT_OUTPUT : str
     Output HDF5 path (default: auto-generated per scene).
 COLLECT_WARMUP : int
@@ -56,6 +56,10 @@ COLLECT_DEBUG : str
     forces, Jacobians, b-reconstruction analysis). Default "0".
 COLLECT_VERBOSE : str
     When "1", print verbose diagnostics during recording. Default "0".
+COLLECT_COMPONENTS : str
+    When "1", record component-resolved proximal/material/base forces and their
+    full-coordinate implicit RHS terms. This implies debug recording and should
+    be used with ``COLLECT_MATRICES=1``.
 """
 from __future__ import annotations
 
@@ -90,7 +94,8 @@ from utils.message_handler import SofaMessageHandler
 from objects.fixed_rigid_body import add_environment
 from robots.catheter import CatheterRobot
 
-from data_collection.generators import SweepGenerator, SinusoidalGenerator
+from data_collection.generators import (
+    SweepGenerator, SinusoidalGenerator, ProximalIdentificationGenerator)
 from data_collection.collector import DataCollectorController
 from data_collection.matrix_recorder import MatrixRecorderController
 
@@ -104,6 +109,7 @@ _SCENES_CONFIG_PATH = os.path.join(_SIM_DIR, "configs", "generated_scenes.yaml")
 _GENERATORS = {
     "sweep": SweepGenerator,
     "sinusoidal": SinusoidalGenerator,
+    "proximal_id": ProximalIdentificationGenerator,
 }
 
 
@@ -519,7 +525,10 @@ def createScene(root: Sofa.Core.Node, headless: bool = False,
 
         tip_force_cfg = cfg.get("tip_force", {})
         tip_force_max = float(tip_force_cfg.get("max_force", 0.5))
-        if not enable_tip_force:
+        # The identification suite requires named force components to sum to
+        # the complete free RHS. An unlabelled random tip force would violate
+        # that reconstruction and confound passive ring-down episodes.
+        if not enable_tip_force or gen_name == "proximal_id":
             tip_force_max = 0.0
 
         controller = DataCollectorController(
@@ -550,6 +559,8 @@ def createScene(root: Sofa.Core.Node, headless: bool = False,
             A_interval = int(os.environ.get("COLLECT_A_INTERVAL", "1"))
             verbose = os.environ.get("COLLECT_VERBOSE", "0") == "1"
             debug = os.environ.get("COLLECT_DEBUG", "0") == "1"
+            record_components = (
+                os.environ.get("COLLECT_COMPONENTS", "0") == "1")
             matrix_recorder = MatrixRecorderController(
                 name="MatrixRecorder",
                 robot=robot,
@@ -557,6 +568,9 @@ def createScene(root: Sofa.Core.Node, headless: bool = False,
                 A_interval=A_interval,
                 verbose=verbose,
                 debug=debug,
+                record_components=record_components,
+                distal_start_section=int(rod_cfg.get(
+                    "distal_start_section", 25)),
             )
             root.addObject(matrix_recorder)
 

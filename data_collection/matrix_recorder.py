@@ -34,6 +34,12 @@ class MatrixRecorderController(Sofa.Core.Controller):
         self._A_interval = int(kwargs.pop("A_interval", 1))
         self._verbose = bool(kwargs.pop("verbose", False))
         self._debug = bool(kwargs.pop("debug", False))
+        self._record_components = bool(kwargs.pop("record_components", False))
+        self._distal_start_section = int(kwargs.pop(
+            "distal_start_section", 25))
+        # Component attribution needs the pre-solve state and free-motion RHS
+        # that belong to the existing debug stream.
+        self._debug = self._debug or self._record_components
 
         self._step = 0
         self._initialized = False
@@ -97,6 +103,16 @@ class MatrixRecorderController(Sofa.Core.Controller):
         self._cable_constraints: list = []
         self._H_strain_list: list = []       # H projected to strain DOFs
         self._H_base_list: list = []         # H projected to base DOFs
+
+        # Privileged full-coordinate component labels, sampled with A_full.
+        self._component_names = (
+            "proximal_bending", "proximal_torsion", "distal_material",
+            "base_insertion", "base_rotation", "base_carriage")
+        self._component_force_list: list = []
+        self._component_rhs_list: list = []
+        self._component_steps: list = []
+        self._component_reconstruction_error: list = []
+        self._component_reconstruction_steps: list = []
 
         # C++ diagnostic solver data (if DiagnosticEulerImplicitSolver is used)
         self._cpp_diag_solver = None
@@ -208,6 +224,15 @@ class MatrixRecorderController(Sofa.Core.Controller):
         self._base_mo = prefab.rigidBaseNode.getObject("RigidBaseMO")
         self._n_base = self._strain_offset
         self._n_full = self._n_base + self._n_strain
+        if self._record_components:
+            if self._n_strain % 3:
+                raise ValueError(
+                    "component recording requires three strain coordinates per section")
+            n_sections = self._n_strain // 3
+            if not 0 <= self._distal_start_section <= n_sections:
+                raise ValueError(
+                    f"distal_start_section={self._distal_start_section} is outside "
+                    f"[0,{n_sections}]")
 
         # Extract the base stiffness block.  Handles both the legacy
         # RestShapeSpringsForceField (constant diagonal spring) and the structured
@@ -289,6 +314,10 @@ class MatrixRecorderController(Sofa.Core.Controller):
               f"n_base={self._n_base}, n_full={self._n_full}, "
               f"offset={self._strain_offset}, "
               f"alpha={alpha}, beta_solver={beta}, beta_ff={self._beta_ff}")
+        if self._record_components:
+            print("[MatrixRecorder] Component-resolved recording enabled: "
+                  f"distal_start_section={self._distal_start_section}, "
+                  f"components={list(self._component_names)}")
         print(f"[MatrixRecorder] q0 rest[:6] = {self._q0[:6]}")
         print(f"[MatrixRecorder] ||q0|| = {np.linalg.norm(self._q0):.6e}")
         if self._verbose:
@@ -441,6 +470,63 @@ class MatrixRecorderController(Sofa.Core.Controller):
             if self._step <= 1:
                 print(f"[MatrixRecorder] H_base read failed: {e}")
 
+    def _component_snapshot(self, q, v, v_base):
+        """Evaluate named full-coordinate force and implicit-RHS components.
+
+        SOFA stores three strain coordinates per section in the order
+        ``[torsion, bend_y, bend_z]``.  The material law is split by coordinate
+        masks, while the custom base force field supplies insertion, rotation,
+        and non-actuated carriage terms through the same side-effect-free
+        evaluator used by its solver callback.
+
+        All terms are evaluated at one common pre-solve state.  The returned
+        right-hand side uses ``b_j = h f_j - h^2 K_j v``.  This is additive for
+        a fixed assembled operator and avoids the invalid alternative of
+        disabling a force field and thereby changing that operator.
+        """
+        ns, nb = self._n_strain, self._n_base
+        q = np.asarray(q, dtype=float).reshape(ns)
+        v = np.asarray(v, dtype=float).reshape(ns)
+        v_base = np.asarray(v_base, dtype=float).reshape(nb)
+        dq = q - self._q0
+        f_rod = -(self._K @ dq) - (self._C_strain @ v)
+
+        proximal = np.zeros(ns, dtype=bool)
+        proximal[:3 * self._distal_start_section] = True
+        torsion = np.zeros(ns, dtype=bool)
+        torsion[0::3] = True
+        masks = (proximal & ~torsion, proximal & torsion, ~proximal)
+        full_velocity = np.concatenate([v_base, v])
+
+        forces = []
+        rhs = []
+        for mask in masks:
+            force = np.zeros(self._n_full)
+            force[nb:][mask] = f_rod[mask]
+            K_j = np.zeros((self._n_full, self._n_full))
+            local = np.flatnonzero(mask)
+            full = local + nb
+            K_j[np.ix_(full, full)] = self._K[np.ix_(local, local)]
+            forces.append(force)
+            rhs.append(self._dt * force
+                       - self._dt ** 2 * (K_j @ full_velocity))
+
+        if self._base_ff is None or not hasattr(
+                self._base_ff, "component_diagnostics"):
+            raise RuntimeError(
+                "component recording requires BaseActuationForceField")
+        base = self._base_ff.component_diagnostics()
+        for name in ("insertion", "rotation", "carriage"):
+            force = np.zeros(self._n_full)
+            force[:nb] = base[f"{name}_force"][:nb]
+            K_j = np.zeros((self._n_full, self._n_full))
+            K_j[:nb, :nb] = base[f"{name}_stiffness"][:nb, :nb]
+            forces.append(force)
+            rhs.append(self._dt * force
+                       - self._dt ** 2 * (K_j @ full_velocity))
+
+        return np.stack(forces), np.stack(rhs)
+
     def onAnimateBeginEvent(self, _event):
         """Record pre-solve state (q, v) before the solver modifies them.
 
@@ -471,8 +557,16 @@ class MatrixRecorderController(Sofa.Core.Controller):
 
             f_begin = np.array(self._strain_mo.force.value).flatten().copy()
             self._f_strain_begin_list.append(f_begin)
-        except Exception:
-            pass
+            if (self._record_components
+                    and self._step % self._A_interval == 0):
+                forces, rhs = self._component_snapshot(q, v, v_base)
+                self._component_force_list.append(forces)
+                self._component_rhs_list.append(rhs)
+                self._component_steps.append(self._step)
+        except Exception as exc:
+            if self._record_components:
+                print(f"[MatrixRecorder] Component recording failed at step "
+                      f"{self._step}: {exc}")
 
     def onAnimateEndEvent(self, _event):
         if self._step == 0:
@@ -780,6 +874,15 @@ class MatrixRecorderController(Sofa.Core.Controller):
         self._diag_list.append(diag)
         self._diag_steps.append(self._step)
 
+        if (self._record_components and "b_dynamics" in diag
+                and self._component_steps
+                and self._component_steps[-1] == self._step):
+            reconstructed = np.sum(self._component_rhs_list[-1], axis=0)
+            exact = diag["b_dynamics"]
+            error = norm(reconstructed - exact) / (norm(exact) + 1e-30)
+            self._component_reconstruction_error.append(float(error))
+            self._component_reconstruction_steps.append(self._step)
+
         if self._verbose:
             print(f"\n[MatrixRecorder] Diagnostic step {self._step}:")
             print(f"  ||b_s||={norm(b_s):.4e} ||x_s||={norm(x_s):.4e}")
@@ -811,6 +914,10 @@ class MatrixRecorderController(Sofa.Core.Controller):
             for key, r in top3:
                 print(f"  {key:25s}: {r*100:.1f}%")
             print(f"  Best: {best_key} ({combos[best_key]*100:.1f}%)")
+            if (self._component_reconstruction_steps
+                    and self._component_reconstruction_steps[-1] == self._step):
+                print("  component RHS reconstruction: "
+                      f"{self._component_reconstruction_error[-1]:.3e}")
 
     def get_data(self) -> dict:
         """Return recorded matrix data as numpy arrays.
@@ -905,6 +1012,20 @@ class MatrixRecorderController(Sofa.Core.Controller):
         if self._H_base_list:
             data["H_base"] = np.stack(self._H_base_list)
 
+        if self._component_force_list:
+            data["component_force_full"] = np.stack(
+                self._component_force_list)
+            data["component_rhs_full"] = np.stack(self._component_rhs_list)
+            data["component_steps"] = np.asarray(
+                self._component_steps, dtype=np.int64)
+            data["component_names"] = np.asarray(
+                self._component_names, dtype="S")
+        if self._component_reconstruction_error:
+            data["component_rhs_reconstruction_relative_error"] = np.asarray(
+                self._component_reconstruction_error, dtype=np.float64)
+            data["component_rhs_reconstruction_steps"] = np.asarray(
+                self._component_reconstruction_steps, dtype=np.int64)
+
         # C++ diagnostic solver data
         for key, vals in self._cpp_diag_data.items():
             if vals:
@@ -941,6 +1062,10 @@ class MatrixRecorderController(Sofa.Core.Controller):
             "dt": self._dt,
             "A_interval": self._A_interval,
             "strain_rotation": self._strain_rot.tolist(),
+            "component_recording": self._record_components,
+            "distal_start_section": self._distal_start_section,
+            "component_names": list(self._component_names),
+            "component_rhs_convention": "b_j = dt*f_j - dt^2*K_j*v",
         }
         # Structured base-actuation parameters (ground truth for supervised
         # training of the base law: f = Kb·P(r−b) − Db·ḃ − F0·tanh(ḃ/v0)).

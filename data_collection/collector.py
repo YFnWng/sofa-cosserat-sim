@@ -114,6 +114,8 @@ class DataCollectorController(Sofa.Core.Controller):
         self._t_start: Optional[float] = None
         self._joint_cmd = np.zeros(3)
         self._t = 0.0
+        self._generator_episode: list[int] = []
+        self._generator_episode_time: list[float] = []
 
     def onAnimateBeginEvent(self, _event) -> None:
         if self._done:
@@ -159,6 +161,12 @@ class DataCollectorController(Sofa.Core.Controller):
             frame_velocity=sofa_gt.frame_velocity,
             strain_velocity=sofa_gt.strain_velocity,
         )
+        episode_index = getattr(self._generator, "episode_index", None)
+        episode_time = getattr(self._generator, "episode_time", None)
+        if callable(episode_index):
+            self._generator_episode.append(int(episode_index(self._t)))
+            self._generator_episode_time.append(
+                float(episode_time(self._t)) if callable(episode_time) else 0.0)
 
         self._step_count += 1
 
@@ -251,5 +259,16 @@ class DataCollectorController(Sofa.Core.Controller):
             "n_timesteps": n,
             **self._metadata,
         }
-        write_hdf5(self._output_path, self._record, metadata=meta)
+        episode_names = getattr(self._generator, "episode_names", None)
+        if episode_names is not None:
+            meta["generator_episode_names"] = list(episode_names)
+            meta["generator_episode_durations"] = list(getattr(
+                self._generator, "episode_durations", []))
+        extra = None
+        if self._generator_episode:
+            extra = {
+                "generator_episode": self._generator_episode,
+                "generator_episode_time": self._generator_episode_time,
+            }
+        write_hdf5(self._output_path, self._record, metadata=meta, extra=extra)
         print(f"[DataCollector] Saved to {self._output_path}")

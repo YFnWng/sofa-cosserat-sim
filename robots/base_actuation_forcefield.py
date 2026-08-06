@@ -168,10 +168,22 @@ class BaseActuationForceField(Sofa.Core.ForceFieldRigid3d):
     def _axial_angle(self, Rq):
         return float(self._u @ (Rq * self._R_home_inv).as_rotvec())
 
-    # -- SOFA hooks ---------------------------------------------------------
-    def addForce(self, m, forces, pos, vel):
-        pos_v = np.asarray(pos.value)
-        vel_v = np.asarray(vel.value)
+    def component_diagnostics(self, pos=None, vel=None):
+        """Evaluate named base-force components without mutating SOFA state.
+
+        This is the single source of truth used by both :meth:`addForce` and
+        the component-resolved matrix recorder.  Forces use SOFA's Rigid3d
+        derivative ordering ``[linear, angular]``.  The returned stiffness and
+        damping matrices are *positive* tangents, i.e. the force Jacobians are
+        ``df/dx=-K`` and ``df/dv=-D``.
+
+        ``insertion`` and ``rotation`` contain only the two actuated channels.
+        ``carriage`` contains the four stiff non-actuated constraints.  Keeping
+        these terms separate is important: their sum is observable at the base,
+        but they have different physical meanings after proximal condensation.
+        """
+        pos_v = np.asarray(self._mo.position.value if pos is None else pos)
+        vel_v = np.asarray(self._mo.velocity.value if vel is None else vel)
         p = pos_v[0, 0:3]
         Rq = R.from_quat(pos_v[0, 3:7])
         v = vel_v[0, 0:3]
@@ -179,7 +191,6 @@ class BaseActuationForceField(Sofa.Core.ForceFieldRigid3d):
 
         r_p, r_R = self._rest_pose()
 
-        # ---- actuated: insertion (along u) -------------------------------
         b_ins = float(self._u @ (p - self._p_home))
         r_ins = float(self._u @ (r_p - self._p_home))
         bdot_ins = float(self._u @ v)
@@ -188,7 +199,6 @@ class BaseActuationForceField(Sofa.Core.ForceFieldRigid3d):
                  - self._Db[0] * bdot_ins
                  - self._F0[0] * np.tanh(bdot_ins / self._v0[0]))
 
-        # ---- actuated: axial rotation (about u) --------------------------
         b_rot = self._axial_angle(Rq)
         r_rot = self._axial_angle(r_R)
         e_rot = _wrap(r_rot - b_rot)
@@ -197,36 +207,78 @@ class BaseActuationForceField(Sofa.Core.ForceFieldRigid3d):
                - self._Db[1] * bdot_rot
                - self._F0[1] * np.tanh(bdot_rot / self._v0[1]))
 
-        # ---- non-actuated: rigid carriage on the orthogonal complement ---
-        e_perp = self._perp @ (r_p - p)               # lateral position error
+        e_perp = self._perp @ (r_p - p)
         v_perp = self._perp @ v
-        f_trans = (f_ins * self._u
-                   + self._K_perp * e_perp
-                   - self._B_perp * v_perp)
-
-        e_R = (r_R * Rq.inv()).as_rotvec()            # small-angle orient error
-        e_tilt = self._perp @ e_R                     # remove axial component
+        carriage_linear = self._K_perp * e_perp - self._B_perp * v_perp
+        e_R = (r_R * Rq.inv()).as_rotvec()
+        e_tilt = self._perp @ e_R
         w_perp = self._perp @ w
-        f_ang = (tau * self._u
-                 + self._K_tilt * e_tilt
-                 - self._B_tilt * w_perp)
+        carriage_angular = self._K_tilt * e_tilt - self._B_tilt * w_perp
 
-        with forces.writeable() as f:
-            f[0][0:3] += f_trans
-            f[0][3:6] += f_ang
+        insertion_force = np.concatenate([f_ins * self._u, np.zeros(3)])
+        rotation_force = np.concatenate([np.zeros(3), tau * self._u])
+        carriage_force = np.concatenate([carriage_linear, carriage_angular])
 
-        # ---- cache tangents for addDForce / addKToMatrix -----------------
-        self._S_ins = self._Kb[0] * _play_deriv(e_ins, self._delta[0], self._eps[0])
-        self._S_rot = self._Kb[1] * _play_deriv(e_rot, self._delta[1], self._eps[1])
+        S_ins = self._Kb[0] * _play_deriv(
+            e_ins, self._delta[0], self._eps[0])
+        S_rot = self._Kb[1] * _play_deriv(
+            e_rot, self._delta[1], self._eps[1])
         sech2_ins = 1.0 - np.tanh(bdot_ins / self._v0[0]) ** 2
         sech2_rot = 1.0 - np.tanh(bdot_rot / self._v0[1]) ** 2
-        self._B_ins = self._Db[0] + self._F0[0] / self._v0[0] * sech2_ins
-        self._B_rot = self._Db[1] + self._F0[1] / self._v0[1] * sech2_rot
+        B_ins = self._Db[0] + self._F0[0] / self._v0[0] * sech2_ins
+        B_rot = self._Db[1] + self._F0[1] / self._v0[1] * sech2_rot
 
-        self.last = {
-            "b_ins": b_ins, "r_ins": r_ins, "bdot_ins": bdot_ins, "f_ins": float(f_ins),
-            "b_rot": b_rot, "r_rot": r_rot, "bdot_rot": bdot_rot, "tau": float(tau),
+        def block6(linear, angular):
+            out = np.zeros((6, 6), dtype=float)
+            out[:3, :3] = linear
+            out[3:, 3:] = angular
+            return out
+
+        insertion_K = block6(S_ins * self._uuT, np.zeros((3, 3)))
+        insertion_D = block6(B_ins * self._uuT, np.zeros((3, 3)))
+        rotation_K = block6(np.zeros((3, 3)), S_rot * self._uuT)
+        rotation_D = block6(np.zeros((3, 3)), B_rot * self._uuT)
+        carriage_K = block6(self._K_perp * self._perp,
+                            self._K_tilt * self._perp)
+        carriage_D = block6(self._B_perp * self._perp,
+                            self._B_tilt * self._perp)
+
+        return {
+            "insertion_force": insertion_force,
+            "rotation_force": rotation_force,
+            "carriage_force": carriage_force,
+            "total_force": insertion_force + rotation_force + carriage_force,
+            "insertion_stiffness": insertion_K,
+            "rotation_stiffness": rotation_K,
+            "carriage_stiffness": carriage_K,
+            "insertion_damping": insertion_D,
+            "rotation_damping": rotation_D,
+            "carriage_damping": carriage_D,
+            "b_ins": b_ins, "r_ins": r_ins, "bdot_ins": bdot_ins,
+            "f_ins": float(f_ins), "b_rot": b_rot, "r_rot": r_rot,
+            "bdot_rot": bdot_rot, "tau": float(tau),
         }
+
+    # -- SOFA hooks ---------------------------------------------------------
+    def addForce(self, m, forces, pos, vel):
+        components = self.component_diagnostics(pos.value, vel.value)
+
+        with forces.writeable() as f:
+            f[0][0:6] += components["total_force"]
+
+        # ---- cache tangents for addDForce / addKToMatrix -----------------
+        self._S_ins = float(
+            self._u @ components["insertion_stiffness"][:3, :3] @ self._u)
+        self._S_rot = float(
+            self._u @ components["rotation_stiffness"][3:, 3:] @ self._u)
+        self._B_ins = float(
+            self._u @ components["insertion_damping"][:3, :3] @ self._u)
+        self._B_rot = float(
+            self._u @ components["rotation_damping"][3:, 3:] @ self._u)
+
+        self.last = {key: components[key] for key in (
+            "b_ins", "r_ins", "bdot_ins", "f_ins",
+            "b_rot", "r_rot", "bdot_rot", "tau")}
 
     def _tangent_blocks(self):
         """Return (Jx_trans, Jx_ang, Jv_trans, Jv_ang) 3x3 force Jacobians.
