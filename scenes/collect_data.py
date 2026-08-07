@@ -39,7 +39,8 @@ trajectory starts from the default rod configuration.
 Environment variables
 ---------------------
 COLLECT_GENERATOR : str
-    Generator type: ``sweep`` (default), ``sinusoidal``, or ``proximal_id``.
+    Generator type: ``sweep`` (default), ``sinusoidal``, ``proximal_id``, or
+    ``ssm_constraint``.
 COLLECT_OUTPUT : str
     Output HDF5 path (default: auto-generated per scene).
 COLLECT_WARMUP : int
@@ -95,7 +96,8 @@ from objects.fixed_rigid_body import add_environment
 from robots.catheter import CatheterRobot
 
 from data_collection.generators import (
-    SweepGenerator, SinusoidalGenerator, ProximalIdentificationGenerator)
+    SweepGenerator, SinusoidalGenerator, ProximalIdentificationGenerator,
+    SSMConstraintGenerator)
 from data_collection.collector import DataCollectorController
 from data_collection.matrix_recorder import MatrixRecorderController
 
@@ -110,6 +112,7 @@ _GENERATORS = {
     "sweep": SweepGenerator,
     "sinusoidal": SinusoidalGenerator,
     "proximal_id": ProximalIdentificationGenerator,
+    "ssm_constraint": SSMConstraintGenerator,
 }
 
 
@@ -528,7 +531,8 @@ def createScene(root: Sofa.Core.Node, headless: bool = False,
         # The identification suite requires named force components to sum to
         # the complete free RHS. An unlabelled random tip force would violate
         # that reconstruction and confound passive ring-down episodes.
-        if not enable_tip_force or gen_name == "proximal_id":
+        if (not enable_tip_force
+                or gen_name in {"proximal_id", "ssm_constraint"}):
             tip_force_max = 0.0
 
         controller = DataCollectorController(
