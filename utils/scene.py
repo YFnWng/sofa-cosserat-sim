@@ -19,6 +19,7 @@ _BASE_PLUGINS = [
     "Sofa.Component.Collision.Geometry",
     "Sofa.Component.Collision.Response.Contact",
     "Sofa.Component.Constraint.Lagrangian.Correction",
+    "Sofa.Component.Constraint.Lagrangian.Model",
     "Sofa.Component.Constraint.Lagrangian.Solver",
     "Sofa.Component.Constraint.Projective",
     "Sofa.Component.Controller",

@@ -56,6 +56,7 @@ def createScene(root: Sofa.Core.Node) -> Sofa.Core.Node:
         CatheterKeyboardController(
             name="CatheterKeyboardController",
             base_mechanical_object=robot.base_mo,
+            base_actuator=robot.base_actuator,
             direction=robot.insertion_direction,
             joint_rate=robot.joint_rate,
             joint_upper_limits=robot.joint_upper_limits,

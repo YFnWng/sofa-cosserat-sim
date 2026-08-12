@@ -42,34 +42,38 @@ rod:
   # Rotates the Cosserat prefab so its local-X rod axis aligns with scene local-Z
   prefab_rotation_euler_xyz_deg: [0.0, -90.0, 0.0]
   proximal_node_idx: 32
-  # Base actuation — realistic insertion/rotation drive with deadzone (backlash)
-  # + friction, replacing the old stiff K=1e10 RestShapeSpringsForceField.
-  # Force law per actuated DOF: f = Kb*P(r-b) - Db*b_dot - F0*tanh(b_dot/v0),
-  # P(e)=softplus(e-delta)-softplus(-e-delta).  Set enabled:false (or delta:0,
-  # F0:0, Kb large) to recover the old stiff-spring behaviour.
+  # Base actuation.  The default rigid-play mode treats encoder position as an
+  # ideal position source with backlash; friction is recorded as motor load.
   base_actuation:
     enabled: true
-    # NOTE: the stiffness Kb*P' enters the implicit matrix (stable for stiff Kb),
-    # but a Python ForceField's velocity terms (Db, friction) are applied
+    # Position-controlled motor/handle transmission.  kinematic_play uses a
+    # history-dependent rigid backlash constraint: outside the gap the base is
+    # kinematically engaged, with no artificial transmission stiffness.
+    # Set mode: spring_deadzone only to reproduce legacy recordings.
+    mode: kinematic_play
+    # The following Kb/Db/F0/eps values are used only by spring_deadzone.  The
+    # kinematic mode uses delta and records the constraint reaction as actuator load.
+    # NOTE: in spring_deadzone, stiffness Kb*P' enters the implicit matrix.
+    # In that legacy mode, Python velocity terms (Db, friction) are applied
     # EXPLICITLY (SOFA gives bFactor=0), so keep Db modest and v0 not too sharp
     # for stability — implicit-Euler numerical dissipation damps the stiff mode.
     # The base is Rayleigh-free (solver β=0; rod damping is an explicit strain FF),
     # so its friction stays visible.  Velocity terms (Db, friction) are explicit
     # (a Python ForceField's velocity tangent doesn't enter the matrix), so keep
     # Db modest and v0 not too sharp for stability.
-    insertion:  # SI: Kb [N/m], Db [N·s/m], F0 [N], v0 [m/s], delta [m], eps [1/m]
+    insertion:  # delta [m]; remaining fields are legacy spring_deadzone parameters
       Kb: 5.0e3
       Db: 2.0
       F0: 0.5
       v0: 5.0e-1         # friction smoothing speed (sharper -> chatter; explicit)
       delta: 1.0e-3      # ~1 mm backlash half-width
       eps: 2.0e2         # eps*delta ~ 4 → fairly sharp deadzone
-    rotation:   # Kb [N·m/rad], Db [N·m·s/rad], F0 [N·m], v0 [rad/s], delta [rad], eps [1/rad]
+    rotation:   # delta [rad]; remaining fields are legacy spring_deadzone parameters
       Kb: 2.0
       Db: 0.02
       F0: 0.02
       v0: 2.0
-      delta: 0.5      # ~30 deg backlash half-width
+      delta: 1.7453292519943295e-1  # 10 deg backlash half-width
       eps: 50.0
     non_actuated:  # rigid carriage on DOFs orthogonal to the insertion axis
       K_perp: 1.0e6

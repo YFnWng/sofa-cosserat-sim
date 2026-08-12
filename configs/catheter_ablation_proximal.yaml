@@ -27,15 +27,14 @@ rod:
   # Rotates the Cosserat prefab so its local-X rod axis aligns with scene local-Z
   prefab_rotation_euler_xyz_deg: [0.0, -90.0, 0.0]
   proximal_node_idx: 25
-  # Base actuation — realistic insertion/rotation drive with deadzone (backlash)
-  # + friction, replacing the old stiff K=1e10 RestShapeSpringsForceField.
-  # Force law per actuated DOF: f = Kb*P(r-b) - Db*b_dot - F0*tanh(b_dot/v0),
-  # P(e)=softplus(e-delta)-softplus(-e-delta).  Set enabled:false (or delta:0,
-  # F0:0, Kb large) to recover the old stiff-spring behaviour.
+  # Position-controlled rigid backlash; friction is an actuator-load diagnostic.
   base_actuation:
     enabled: true
-    # NOTE: the stiffness Kb*P' enters the implicit matrix (stable for stiff Kb),
-    # but a Python ForceField's velocity terms (Db, friction) are applied
+    # Rigid, history-dependent backlash.  Kb/Db/F0/v0/eps below are retained
+    # only so mode: spring_deadzone can reproduce the legacy dataset.
+    mode: kinematic_play
+    # NOTE: in spring_deadzone, stiffness Kb*P' enters the implicit matrix.
+    # In that legacy mode, Python velocity terms (Db, friction) are applied
     # EXPLICITLY (SOFA gives bFactor=0), so keep Db modest and v0 not too sharp
     # for stability — implicit-Euler numerical dissipation damps the stiff mode.
     # The base is Rayleigh-free (solver β=0; rod damping is an explicit strain FF),

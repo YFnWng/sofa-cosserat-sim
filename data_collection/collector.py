@@ -52,6 +52,7 @@ class DataCollectorController(Sofa.Core.Controller):
         self._generator: InputGenerator = kwargs.pop("generator")
         self._reader = kwargs.pop("reader")
         self._base_mo = kwargs.pop("base_mechanical_object")
+        self._base_actuator = kwargs.pop("base_actuator", None)
         self._cable_constraint = kwargs.pop("cable_constraint", None)
         self._output_path: str = kwargs.pop("output_path", "trajectory.h5")
         self._warmup_steps: int = kwargs.pop("warmup_steps", 50)
@@ -116,6 +117,12 @@ class DataCollectorController(Sofa.Core.Controller):
         self._t = 0.0
         self._generator_episode: list[int] = []
         self._generator_episode_time: list[float] = []
+        self._base_play_output: list[np.ndarray] = []
+        self._base_play_velocity: list[np.ndarray] = []
+        self._base_play_acceleration: list[np.ndarray] = []
+        self._base_play_branch: list[np.ndarray] = []
+        self._base_play_friction_reaction: list[np.ndarray] = []
+        self._base_constraint_reaction: list[np.ndarray] = []
 
     def onAnimateBeginEvent(self, _event) -> None:
         if self._done:
@@ -161,6 +168,20 @@ class DataCollectorController(Sofa.Core.Controller):
             frame_velocity=sofa_gt.frame_velocity,
             strain_velocity=sofa_gt.strain_velocity,
         )
+        if self._base_actuator is not None:
+            diagnostics = self._base_actuator.last
+            self._base_play_output.append(
+                np.asarray(diagnostics["output"], dtype=float).copy())
+            self._base_play_velocity.append(
+                np.asarray(diagnostics["velocity"], dtype=float).copy())
+            self._base_play_acceleration.append(
+                np.asarray(diagnostics["acceleration"], dtype=float).copy())
+            self._base_play_branch.append(
+                np.asarray(diagnostics["branch"], dtype=float).copy())
+            self._base_play_friction_reaction.append(np.asarray(
+                diagnostics["friction_reaction"], dtype=float).copy())
+            self._base_constraint_reaction.append(
+                self._base_actuator.constraint_reaction())
         episode_index = getattr(self._generator, "episode_index", None)
         episode_time = getattr(self._generator, "episode_time", None)
         if callable(episode_index):
@@ -189,6 +210,8 @@ class DataCollectorController(Sofa.Core.Controller):
                     and len(self._base_mo.rest_position.value) > 0):
                 with self._base_mo.rest_position.writeable() as rest:
                     rest[0][:] = bp
+            if self._base_actuator is not None:
+                self._base_actuator.reset_from_pose(bp)
 
         if self._initial_strain_coords is not None and self._strain_mo is not None:
             sc = self._initial_strain_coords
@@ -225,23 +248,24 @@ class DataCollectorController(Sofa.Core.Controller):
         rotation_deg = joint_cmd[1]
         cable_val = joint_cmd[2]
 
-        translation = self._direction * insertion
-        rotation = R.from_rotvec(rotation_deg * self._direction, degrees=True)
-        base_orientation = (
-            rotation * self._base_home_orientation * self._prefab_rot_offset
-        ).as_quat()
-        target_pos = (self._base_home_position + translation).tolist()
-        target_ori = base_orientation.tolist()
+        if self._base_actuator is not None:
+            dt = float(self._base_mo.getContext().dt.value)
+            self._base_actuator.set_command(insertion, rotation_deg, dt)
+        else:
+            translation = self._direction * insertion
+            rotation = R.from_rotvec(rotation_deg * self._direction, degrees=True)
+            base_orientation = (
+                rotation * self._base_home_orientation * self._prefab_rot_offset
+            ).as_quat()
+            target_pos = (self._base_home_position + translation).tolist()
+            target_ori = base_orientation.tolist()
 
-        # Only update rest_position (spring target), not position directly.
-        # The RestShapeSpringsForceField pulls the base toward the target,
-        # letting base motion propagate through rod dynamics instead of
-        # being applied as a rigid transform.
-        if (hasattr(self._base_mo, "rest_position")
-                and len(self._base_mo.rest_position.value) > 0):
-            with self._base_mo.rest_position.writeable() as rest:
-                rest[0][0:3] = target_pos
-                rest[0][3:7] = target_ori
+            # Legacy spring-deadzone mode: update the compliant force target.
+            if (hasattr(self._base_mo, "rest_position")
+                    and len(self._base_mo.rest_position.value) > 0):
+                with self._base_mo.rest_position.writeable() as rest:
+                    rest[0][0:3] = target_pos
+                    rest[0][3:7] = target_ori
 
         if self._cable_data is not None:
             self._cable_data.value = [cable_val * self._SOFA_CABLE_SCALE]
@@ -259,16 +283,31 @@ class DataCollectorController(Sofa.Core.Controller):
             "n_timesteps": n,
             **self._metadata,
         }
+        if self._base_actuator is not None:
+            meta["base_actuation"] = self._base_actuator.metadata()
         episode_names = getattr(self._generator, "episode_names", None)
         if episode_names is not None:
             meta["generator_episode_names"] = list(episode_names)
             meta["generator_episode_durations"] = list(getattr(
                 self._generator, "episode_durations", []))
         extra = None
-        if self._generator_episode:
-            extra = {
-                "generator_episode": self._generator_episode,
-                "generator_episode_time": self._generator_episode_time,
-            }
+        if self._generator_episode or self._base_play_output:
+            extra = {}
+            if self._generator_episode:
+                extra.update({
+                    "generator_episode": self._generator_episode,
+                    "generator_episode_time": self._generator_episode_time,
+                })
+            if self._base_play_output:
+                extra.update({
+                    "base_play_output": self._base_play_output,
+                    "base_play_velocity": self._base_play_velocity,
+                    "base_play_acceleration": self._base_play_acceleration,
+                    "base_play_branch": self._base_play_branch,
+                    "base_play_friction_reaction":
+                        self._base_play_friction_reaction,
+                    "base_constraint_reaction":
+                        self._base_constraint_reaction,
+                })
         write_hdf5(self._output_path, self._record, metadata=meta, extra=extra)
         print(f"[DataCollector] Saved to {self._output_path}")

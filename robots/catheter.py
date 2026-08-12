@@ -26,6 +26,7 @@ from useful.params import (  # type: ignore
 
 from utils.cable_utils import compute_cable_points
 from robots.base_actuation_forcefield import BaseActuationForceField
+from robots.kinematic_base_actuation import KinematicPlayBaseActuator
 
 _DEFAULT_CONFIG = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -93,7 +94,8 @@ class CatheterRobot:
         rod_cfg = cfg.get("rod", {})
         act_cfg = cfg.get("actuation", {})
 
-        self._prefab, self._collision, self.cable_constraints = _build(
+        (self._prefab, self._collision, self.cable_constraints,
+         self.base_actuator) = _build(
             root, rod_cfg, act_cfg, cable_mode=cable_mode
         )
         self.base_mo = self._prefab.rigidBaseNode.RigidBaseMO  # type: ignore[attr-defined]
@@ -360,9 +362,8 @@ def _build(
         rod_cfg.get("rayleigh_stiffness_ff", 0.0))
 
     base_act_cfg = rod_cfg.get("base_actuation", {})
+    base_actuator = None
     if base_act_cfg.get("enabled", False):
-        # Realistic base drive: soft structured law (deadzone/backlash + friction)
-        # on insertion + axial rotation, rigid carriage on the other DOFs.
         # Frame conventions mirror the controllers (see collector.py):
         #   u (world insertion axis) = direction_local @ base_orient.T
         #   q_home_full              = base_orient * prefab_rot
@@ -370,18 +371,64 @@ def _build(
             act_cfg.get("insertion_direction", [0.0, 0.0, 1.0]), dtype=float)
         u_world = direction_local @ base_orient.as_matrix().T
         q_home_full = (base_orient * prefab_rot).as_quat().tolist()
-        prefab.rigidBaseNode.addObject(  # type: ignore[attr-defined]
-            BaseActuationForceField(
-                name="BaseAttachment",
-                mo=prefab.rigidBaseNode.RigidBaseMO,  # type: ignore[attr-defined]
-                insertion_axis=u_world.tolist(),
-                home_position=list(base_pos),
-                home_orientation=q_home_full,
-                insertion=base_act_cfg["insertion"],
-                rotation=base_act_cfg["rotation"],
-                non_actuated=base_act_cfg["non_actuated"],
+        base_mode = base_act_cfg.get("mode", "spring_deadzone")
+        if base_mode == "spring_deadzone":
+            # Backward-compatible compliant penalty actuator.
+            prefab.rigidBaseNode.addObject(  # type: ignore[attr-defined]
+                BaseActuationForceField(
+                    name="BaseAttachment",
+                    mo=prefab.rigidBaseNode.RigidBaseMO,  # type: ignore[attr-defined]
+                    insertion_axis=u_world.tolist(),
+                    home_position=list(base_pos),
+                    home_orientation=q_home_full,
+                    insertion=base_act_cfg["insertion"],
+                    rotation=base_act_cfg["rotation"],
+                    non_actuated=base_act_cfg["non_actuated"],
+                )
             )
-        )
+        elif base_mode == "kinematic_play":
+            # The target has no ODE solver: its position and velocity are known
+            # inputs.  The bilateral constraint corrects the *dynamic* base via
+            # the full coupled compliance, retaining base/strain inertial coupling.
+            target_node = root.addChild("BaseCommandTarget")
+            target_mo = target_node.addObject(
+                "MechanicalObject",
+                name="BaseCommandMO",
+                template="Rigid3d",
+                position=[[*base_pos, *q_home_full]],
+                rest_position=[[*base_pos, *q_home_full]],
+            )
+            base_constraint = prefab.rigidBaseNode.addObject(  # type: ignore[attr-defined]
+                "BilateralLagrangianConstraint",
+                name="BaseAttachment",
+                template="Rigid3d",
+                object1="@RigidBaseMO",
+                object2=target_mo.getLinkPath(),
+                first_point=[0],
+                second_point=[0],
+                keepOrientationDifference=False,
+            )
+            base_actuator = KinematicPlayBaseActuator(
+                target_mo=target_mo,
+                constraint=base_constraint,
+                insertion_axis=u_world,
+                home_position=base_pos,
+                home_orientation=q_home_full,
+                insertion_deadzone=float(base_act_cfg["insertion"]["delta"]),
+                rotation_deadzone=float(base_act_cfg["rotation"]["delta"]),
+                friction_plateau=[
+                    float(base_act_cfg["insertion"].get("F0", 0.0)),
+                    float(base_act_cfg["rotation"].get("F0", 0.0)),
+                ],
+                friction_speed=[
+                    float(base_act_cfg["insertion"].get("v0", 1.0)),
+                    float(base_act_cfg["rotation"].get("v0", 1.0)),
+                ],
+            )
+        else:
+            raise ValueError(
+                f"unknown rod.base_actuation.mode={base_mode!r}; expected "
+                "'spring_deadzone' or 'kinematic_play'")
     else:
         # Fallback: legacy stiff spring (A/B regression baseline).
         prefab.rigidBaseNode.addObject(  # type: ignore[attr-defined]
@@ -437,7 +484,7 @@ def _build(
         collision.CollisionDOFs.showObject = False  # type: ignore[attr-defined]
 
     cable_constraints = _add_cables(prefab, act_cfg, cable_mode=cable_mode)
-    return prefab, collision, cable_constraints
+    return prefab, collision, cable_constraints, base_actuator
 
 
 def _add_cables(

@@ -40,7 +40,9 @@ Environment variables
 ---------------------
 COLLECT_GENERATOR : str
     Generator type: ``sweep`` (default), ``sinusoidal``, ``proximal_id``, or
-    ``ssm_constraint``.
+    ``ssm_constraint``, or ``rich_proximal``.
+COLLECT_SEED : int
+    Reproducible generator seed (default: 0).
 COLLECT_OUTPUT : str
     Output HDF5 path (default: auto-generated per scene).
 COLLECT_WARMUP : int
@@ -97,7 +99,7 @@ from robots.catheter import CatheterRobot
 
 from data_collection.generators import (
     SweepGenerator, SinusoidalGenerator, ProximalIdentificationGenerator,
-    SSMConstraintGenerator)
+    SSMConstraintGenerator, RichProximalGenerator)
 from data_collection.collector import DataCollectorController
 from data_collection.matrix_recorder import MatrixRecorderController
 
@@ -113,6 +115,7 @@ _GENERATORS = {
     "sinusoidal": SinusoidalGenerator,
     "proximal_id": ProximalIdentificationGenerator,
     "ssm_constraint": SSMConstraintGenerator,
+    "rich_proximal": RichProximalGenerator,
 }
 
 
@@ -404,6 +407,7 @@ def createScene(root: Sofa.Core.Node, headless: bool = False,
         kbd = CatheterKeyboardController(
             name="CatheterKeyboardController",
             base_mechanical_object=robot.base_mo,
+            base_actuator=robot.base_actuator,
             direction=robot.insertion_direction,
             joint_rate=robot.joint_rate,
             joint_upper_limits=robot.joint_upper_limits,
@@ -456,9 +460,11 @@ def createScene(root: Sofa.Core.Node, headless: bool = False,
             raise ValueError(f"Unknown generator: {gen_name!r}. "
                              f"Available: {list(_GENERATORS.keys())}")
         gen_kwargs = {}
+        import inspect
+        if "seed" in inspect.signature(gen_cls.__init__).parameters:
+            gen_kwargs["seed"] = int(os.environ.get("COLLECT_SEED", "0"))
         duration = float(os.environ.get("COLLECT_DURATION", "0"))
         if duration > 0:
-            import inspect
             if "duration" in inspect.signature(gen_cls.__init__).parameters:
                 gen_kwargs["duration"] = duration
         if hasattr(robot, "joint_rate"):
@@ -532,7 +538,8 @@ def createScene(root: Sofa.Core.Node, headless: bool = False,
         # the complete free RHS. An unlabelled random tip force would violate
         # that reconstruction and confound passive ring-down episodes.
         if (not enable_tip_force
-                or gen_name in {"proximal_id", "ssm_constraint"}):
+                or gen_name in {"proximal_id", "ssm_constraint",
+                                "rich_proximal"}):
             tip_force_max = 0.0
 
         controller = DataCollectorController(
@@ -540,6 +547,7 @@ def createScene(root: Sofa.Core.Node, headless: bool = False,
             generator=generator,
             reader=reader,
             base_mechanical_object=robot.base_mo,
+            base_actuator=robot.base_actuator,
             cable_constraint=robot.cable_constraint,
             direction=robot.insertion_direction,
             base_position=robot.base_position,
@@ -859,6 +867,8 @@ def run_headless(output_dir="", scene_indices=None):
     if gen_cls is not None:
         import inspect
         sig = inspect.signature(gen_cls.__init__)
+        if "seed" in sig.parameters:
+            gen_kwargs["seed"] = int(os.environ.get("COLLECT_SEED", "0"))
         duration = float(os.environ.get("COLLECT_DURATION", "0"))
         if duration > 0 and "duration" in sig.parameters:
             gen_kwargs["duration"] = duration

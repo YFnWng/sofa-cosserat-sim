@@ -257,9 +257,37 @@ The constraint solver (`ProjectedGaussSeidelConstraintSolver`) solves for Lagran
   - Source: `RigidCoord.h:108-131`, `operator+=` with `Quat::axisToQuat`
 - **Quaternion double-cover**: `q ≡ -q`; SOFA handles via `if (dq[3] < 0) dq *= -1` in `quatToAxis()` (`Quat.inl:249-276`)
 
-### Base Motion: Prescribed via RestShapeSpringsForceField
+### Base Motion: Position-Controlled Rigid Play (current default)
 
-- Controller updates `rest_position` each step: `q_rest = R_user(θ) · R_home · R_prefab`
+The current `kinematic_play` mode does **not** use a base spring.  For each
+actuated scalar (insertion and unwrapped rotation), it first updates a
+rate-independent backlash state
+
+```
+b[k+1] = clip(b[k], r[k+1] - delta, r[k+1] + delta).
+```
+
+At `AnimateBegin`, the motor sample is zero-order held.  The kinematic target
+stores `b[k]`, the end-of-step free pose stores `b[k+1]`, and its velocity is
+`(b[k+1]-b[k])/dt`.  A `BilateralLagrangianConstraint` attaches the dynamic
+Cosserat base to this target.  Consequently:
+
+- `K_base = 0`: there is no transmission compliance in the free-motion matrix;
+- the constraint correction uses the full coupled compliance and therefore
+  preserves base/strain inertial coupling;
+- `bdot` is the step velocity and `bddot=(bdot[k+1]-bdot[k])/dt` is a recorded
+  discrete diagnostic, not a separately injected force;
+- the first six constraint multipliers give the actuator reaction;
+- tanh friction is recorded as additional motor load and does not change the
+  motion of an ideal position source.
+
+Implementation: `robots/kinematic_base_actuation.py` and the
+`kinematic_play` branch in `robots/catheter.py`.
+
+### Legacy Base Motion: Rest/Penalty Spring
+
+- In `spring_deadzone` or the older fallback, the controller updates
+  `rest_position` each step: `q_rest = R_user(θ) · R_home · R_prefab`
   - Source: `controllers/keyboard_controller.py:101-117`, `_apply_base_pose()`
   - `θ` = rotation joint command (±180°), insertion = z-translation
 - **Nonlinear force** (addForce, `RestShapeSpringsForceField.inl:396-423`):
@@ -275,7 +303,8 @@ The constraint solver (`ProjectedGaussSeidelConstraintSolver`) solves for Lagran
 
 ### Coupling: Base → Strain
 
-- **No direct stiffness coupling**: `K_bs = K_sb = 0` (RestShapeSprings is local to base, BeamHookeLaw is local to strain)
+- **No direct stiffness coupling**: `K_bs = K_sb = 0`. In kinematic-play mode
+  `K_base` is also zero.
 - **Mass coupling via Cosserat mapping**: `M_sb = J_strain^T · M_frame · J_base`
   - `||M_sb|| / ||M_ss|| = 31×` — large coupling through mapped mass
   - Enters strain RHS: `b_s += h·(-α)·M_sb·v_base`

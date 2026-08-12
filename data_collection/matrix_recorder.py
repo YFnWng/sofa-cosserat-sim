@@ -390,7 +390,10 @@ class MatrixRecorderController(Sofa.Core.Controller):
         """Recursively find CableConstraint objects in the scene graph."""
         for obj in node.objects:
             if "CableConstraint" in obj.getClassName():
-                self._cable_constraints.append(obj)
+                path = str(obj.getLinkPath())
+                if not any(str(existing.getLinkPath()) == path
+                           for existing in self._cable_constraints):
+                    self._cable_constraints.append(obj)
         for child in node.children:
             self._find_cable_constraints(child)
 
@@ -429,6 +432,12 @@ class MatrixRecorderController(Sofa.Core.Controller):
                         pass
                     elif H_strain.shape[1] == ns // 3:
                         H_strain = H_strain.reshape(H_strain.shape[0], -1)
+                    # The global constraint matrix can also contain the six
+                    # kinematic-base rows and contact rows.  Preserve the
+                    # historical meaning of H_strain: tendon rows only.
+                    rows = [int(c.constraintIndex.value)
+                            for c in self._cable_constraints]
+                    H_strain = H_strain[rows]
                 self._H_strain_list.append(H_strain.copy())
                 if self._step <= 1:
                     print(f"[MatrixRecorder] H_strain: shape={H_strain.shape}, "
@@ -459,6 +468,10 @@ class MatrixRecorderController(Sofa.Core.Controller):
             if H_base is not None:
                 if H_base.ndim == 2 and H_base.shape[1] != nb:
                     H_base = H_base.reshape(H_base.shape[0], -1)[:, :nb]
+                if H_base.ndim == 2:
+                    rows = [int(c.constraintIndex.value)
+                            for c in self._cable_constraints]
+                    H_base = H_base[rows]
                 self._H_base_list.append(H_base.copy())
                 if self._step <= 1:
                     print(f"[MatrixRecorder] H_base: shape={H_base.shape}, "
@@ -511,19 +524,25 @@ class MatrixRecorderController(Sofa.Core.Controller):
             rhs.append(self._dt * force
                        - self._dt ** 2 * (K_j @ full_velocity))
 
-        if self._base_ff is None or not hasattr(
-                self._base_ff, "component_diagnostics"):
-            raise RuntimeError(
-                "component recording requires BaseActuationForceField")
-        base = self._base_ff.component_diagnostics()
-        for name in ("insertion", "rotation", "carriage"):
-            force = np.zeros(self._n_full)
-            force[:nb] = base[f"{name}_force"][:nb]
-            K_j = np.zeros((self._n_full, self._n_full))
-            K_j[:nb, :nb] = base[f"{name}_stiffness"][:nb, :nb]
-            forces.append(force)
-            rhs.append(self._dt * force
-                       - self._dt ** 2 * (K_j @ full_velocity))
+        if (self._base_ff is not None
+                and hasattr(self._base_ff, "component_diagnostics")):
+            base = self._base_ff.component_diagnostics()
+            for name in ("insertion", "rotation", "carriage"):
+                force = np.zeros(self._n_full)
+                force[:nb] = base[f"{name}_force"][:nb]
+                K_j = np.zeros((self._n_full, self._n_full))
+                K_j[:nb, :nb] = base[f"{name}_stiffness"][:nb, :nb]
+                forces.append(force)
+                rhs.append(self._dt * force
+                           - self._dt ** 2 * (K_j @ full_velocity))
+        else:
+            # In kinematic_play mode the base actuation is a constraint
+            # correction, not a force in the free-motion RHS.  Keep the legacy
+            # component slots as exact zeros so free-RHS reconstruction remains
+            # additive; the reaction is recorded separately in base_lambda.
+            for _name in ("insertion", "rotation", "carriage"):
+                forces.append(np.zeros(self._n_full))
+                rhs.append(np.zeros(self._n_full))
 
         return np.stack(forces), np.stack(rhs)
 
@@ -1070,6 +1089,9 @@ class MatrixRecorderController(Sofa.Core.Controller):
         # Structured base-actuation parameters (ground truth for supervised
         # training of the base law: f = Kb·P(r−b) − Db·ḃ − F0·tanh(ḃ/v0)).
         base_params = self._base_actuation_metadata(self._base_ff)
+        actuator = getattr(self._robot, "base_actuator", None)
+        if actuator is not None:
+            base_params = actuator.metadata()
         if base_params is not None:
             meta["base_actuation"] = base_params
         if self._cable_constraints:

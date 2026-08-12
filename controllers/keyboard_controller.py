@@ -25,6 +25,7 @@ class CatheterKeyboardController(Sofa.Core.Controller):
         super().__init__(*args, **kwargs)
 
         self.base_mo = kwargs.pop("base_mechanical_object", None)
+        self.base_actuator = kwargs.pop("base_actuator", None)
         
         self.joint_pos = np.zeros(3)
         self.joint_rate = kwargs.pop("joint_rate", np.zeros(3))
@@ -99,6 +100,12 @@ class CatheterKeyboardController(Sofa.Core.Controller):
         self.pressed_keys.discard(key.lower())
 
     def _apply_base_pose(self) -> None:
+        if self.base_actuator is not None:
+            dt = float(self.base_mo.getContext().dt.value)
+            self.base_actuator.set_command(
+                float(self.joint_pos[0]), float(self.joint_pos[1]), dt)
+            return
+
         translation = self.direction * self.joint_pos[0]
         rotation = R.from_rotvec(self.joint_pos[1] * self.direction, degrees=True)
         # Compose: user rotation × semantic home × prefab offset.
@@ -107,10 +114,7 @@ class CatheterKeyboardController(Sofa.Core.Controller):
         base_orientation = (rotation * self._base_home_orientation * self._prefab_rot_offset).as_quat()
         target_pos = (self.base_home_position + translation).tolist()
         target_ori = base_orientation.tolist()
-        # Only update rest_position (spring target), not position directly.
-        # The RestShapeSpringsForceField pulls the base toward the target,
-        # letting base motion propagate through rod dynamics instead of
-        # being applied as a rigid transform.
+        # Legacy spring-deadzone mode: update the compliant force target.
         if hasattr(self.base_mo, "rest_position") and len(self.base_mo.rest_position.value) > 0:
             with self.base_mo.rest_position.writeable() as rest:
                 rest[0][0:3] = target_pos
